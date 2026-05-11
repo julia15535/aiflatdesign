@@ -1,0 +1,54 @@
+# Python
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Секреты
+.env
+.env.local
+.env.*.local
+
+# Данные пользователей / тестовые
+data/*.db
+data/*.db-journal
+data/results/
+data/test_inspirations/
+data/test_catalog/
+*.log
+
+# Memory bank — что НЕ в git
+.memory_bank/_claude/SECRETS.md
+.memory_bank/business/*.png
+.memory_bank/business/*.jpg
+.memory_bank/business/*.pdf
+.memory_bank/plans/draft_*.md
+
+# Reference (туториал другого проекта, не наш код)
+memory_bank_reference/
+
+# Claude локальные настройки (пользовательские предпочтения)
+.claude/settings.local.json
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Build artifacts
+build/
+dist/
+*.egg-info/

@@ -1,0 +1,10 @@
+# Секреты — НИКОГДА не в git
+_claude/SECRETS.md
+
+# Бизнес-материалы с возможными скринами / sensitive
+business/*.png
+business/*.jpg
+business/*.pdf
+
+# Локальные временные планы (drafts)
+plans/draft_*.md
