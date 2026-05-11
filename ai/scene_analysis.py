@@ -16,7 +16,7 @@ from typing import Final
 
 from openai import APIError, AsyncOpenAI
 
-from ai.prompts import SLOT_ESTIMATION
+from ai.prompts import SLOT_AFTER_REMOVAL, SLOT_ESTIMATION
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +83,91 @@ def _fallback_estimate(target_en: str, reason: str) -> dict:
         "warnings": [f"ai_unavailable: {reason}"],
         "is_target_appropriate_for_room": True,
         "appropriate_explanation": "",
+        "_fallback": True,
+    }
+
+
+async def estimate_post_removal_slot(
+    scene_url: str,
+    to_remove: str,
+    to_add_with_placement: str,
+    ceiling_cm: int,
+    room_description: str,
+) -> dict:
+    """Vision-оценка размеров свободного места ПОСЛЕ удаления `to_remove`.
+
+    Возвращает dict:
+        free_area_after_removal: {width_cm, depth_cm, height_cm}
+        confidence: "low|medium|high"
+        reasoning: str (на русском)
+        warnings: list[str]
+    """
+    prompt = SLOT_AFTER_REMOVAL.format(
+        to_remove=to_remove,
+        to_add_with_placement=to_add_with_placement or "куда угодно",
+        ceiling_cm=ceiling_cm,
+        room_description=room_description or "не указано",
+    )
+
+    try:
+        client = _build_client()
+        response = await client.chat.completions.create(
+            model=VISION_MODEL,
+            response_format={"type": "json_object"},
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": scene_url, "detail": "high"},
+                        },
+                    ],
+                }
+            ],
+            max_tokens=MAX_TOKENS,
+        )
+    except APIError as e:
+        return _post_removal_fallback(f"OpenAI API: {e}")
+    except Exception as e:  # noqa: BLE001
+        return _post_removal_fallback(f"unexpected: {type(e).__name__}: {e}")
+
+    content = response.choices[0].message.content or ""
+    try:
+        result = json.loads(content)
+    except json.JSONDecodeError as e:
+        return _post_removal_fallback(f"невалидный JSON: {e}")
+
+    area = result.get("free_area_after_removal")
+    if not isinstance(area, dict) or not all(k in area for k in ("width_cm", "depth_cm", "height_cm")):
+        return _post_removal_fallback("в ответе нет полного free_area_after_removal")
+
+    for axis in ("width_cm", "depth_cm", "height_cm"):
+        try:
+            area[axis] = int(area[axis])
+        except (TypeError, ValueError):
+            return _post_removal_fallback(f"некорректное {axis}: {area.get(axis)!r}")
+        if not (10 <= area[axis] <= 600):
+            return _post_removal_fallback(f"{axis}={area[axis]} вне диапазона 10-600")
+
+    logger.info(
+        "Post-removal slot: %sx%sx%s, confidence=%s, reasoning=%s",
+        area["width_cm"], area["depth_cm"], area["height_cm"],
+        result.get("confidence"),
+        (result.get("reasoning") or "")[:80],
+    )
+    return result
+
+
+def _post_removal_fallback(reason: str) -> dict:
+    """Дефолт когда vision упал. Берём средние «комнатные» цифры."""
+    logger.warning("Post-removal slot fallback: %s", reason)
+    return {
+        "free_area_after_removal": {"width_cm": 200, "depth_cm": 90, "height_cm": 220},
+        "confidence": "low",
+        "reasoning": f"Не удалось оценить ({reason}). Беру средние цифры для жилой комнаты.",
+        "warnings": [f"vision_unavailable: {reason}"],
         "_fallback": True,
     }
 

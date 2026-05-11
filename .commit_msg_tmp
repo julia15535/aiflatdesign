@@ -1,32 +1,32 @@
-Шаг 3: реальная генерация через OpenAI gpt-image-2
+Шаг 3.5: двухфазная генерация + свободный текст без словаря
 
-Заменили заглушку _finish на реальный вызов /v1/images/edits с моделью
-gpt-image-2. Получаем фото комнаты со вписанным товаром одним запросом.
+Pipeline переработан:
+- Удалили словарь ai/object_mapping.py — пользовательский ввод свободный
+  (можно писать "стулья, диван и пол почистить" — ChatGPT понимает)
+- Добавили промежуточный этап А: gpt-image-2 убирает указанные объекты
+  и рисует на картинке размеры свободного места + GPT-5.4-mini параллельно
+  возвращает JSON с теми же цифрами
+- Пользователь подтверждает или правит размеры свободно текстом
+- Этап Б: финальная генерация с товаром берёт ИСХОДНОЕ фото (без цифр)
 
-Новый диалог:
-- Разделили "что заменить" на два вопроса: что УБРАТЬ (стол) и что ПОСТАВИТЬ (шкаф)
-- После размеров и pre-flight check — реальная генерация (20-30 сек)
-- Бот отправляет финальное фото пользователю в Telegram
+Новые промпты в ai/prompts.py:
+- SLOT_AFTER_REMOVAL — vision-оценка свободного места после удаления
+- REMOVAL_WITH_DIMENSIONS — image-edit с подписями размеров
+- GENERATION переписан под русские параметры и подтверждённый слот
 
-Новый код:
-- ai/generation.py: generate_room_with_product() через AsyncOpenAI.images.edit
-  - Скачивает фото с 0x0.st как bytes (SDK 2.36 не принимает URL)
-  - Динамический выбор размера выхода по ориентации сцены
-  - Fallback на gpt-image-1.5 если основная модель недоступна
-  - Возвращает image_bytes или error с типом ошибки
-- ai/prompts.py: добавлен GENERATION (английский, акцент на сохранение визуала + сцены)
-- handlers.py: обработчики waiting_to_remove + waiting_to_add, реальная генерация в _finish
-- states.py: waiting_target_class -> waiting_to_remove + waiting_to_add
-- db.py: колонки sessions.to_remove + to_add, функция log_generation()
-- .env.example: OPENAI_IMAGE_MODEL/QUALITY/INPUT_FIDELITY
+Новые функции:
+- ai/scene_analysis.py: estimate_post_removal_slot()
+- ai/generation.py: generate_removal_with_dimensions() для этапа А
+- generate_room_with_product() переписан под этап Б
+- utils/storage.py: download_with_retry() — 3 попытки с задержками
 
-Параметры по умолчанию:
-- gpt-image-2, quality=medium ($0.024/картинку), input_fidelity=high
-- Размеры: 1536x1024 / 1024x1024 / 1024x1536 (по ориентации сцены)
-- Лимит: 5 успешных генераций в сутки на пользователя
+FSM:
+- waiting_to_remove + waiting_to_add — свободный текст без словаря
+- confirming_slot_dimensions — кнопки после этапа А
+- editing_slot_dimensions — пользователь правит размеры текстом
 
-Память проекта:
-- DECISIONS.md: обоснование отказа от Replicate
-- ai/generation.md: переписано под gpt-image-2
-- _claude/PROJECT-STATE.md: фаза = Шаг 3
-- plans/day_3_openai_generation.md
+Исправлены проблемы:
+- "Server disconnected" при скачивании с 0x0.st (retry + backoff)
+- Словарь распознавал только частичные запросы
+
+Цена flow: ~$0.057 (2 image-edit + vision). Время: ~60-80 сек.

@@ -19,11 +19,11 @@ import os
 import time
 from typing import Final
 
-import httpx
 from openai import APIError, AsyncOpenAI
 from PIL import Image
 
-from ai.prompts import GENERATION
+from ai.prompts import GENERATION, REMOVAL_WITH_DIMENSIONS
+from utils.storage import download_with_retry
 
 logger = logging.getLogger(__name__)
 
@@ -49,11 +49,8 @@ def _build_client() -> AsyncOpenAI:
 
 
 async def _download_image(url: str) -> bytes:
-    """Скачать картинку по URL (с 0x0.st или catbox.moe)."""
-    async with httpx.AsyncClient(timeout=DOWNLOAD_TIMEOUT_SEC, follow_redirects=True) as client:
-        resp = await client.get(url)
-        resp.raise_for_status()
-        return resp.content
+    """Скачать картинку по URL с retry (utils.storage.download_with_retry)."""
+    return await download_with_retry(url, timeout_sec=DOWNLOAD_TIMEOUT_SEC)
 
 
 def _detect_output_size(image_bytes: bytes) -> str:
@@ -78,33 +75,8 @@ def _estimate_cost(model: str, quality: str) -> float:
     return _PRICES_PER_IMAGE.get(model, {}).get(quality, 0.024)
 
 
-async def generate_room_with_product(
-    scene_url: str,
-    product_url: str,
-    to_remove_en: str,
-    to_remove_ru: str,
-    to_add_en: str,
-    to_add_ru: str,
-    ceiling_cm: int,
-    room_description: str,
-    product_dims_cm: tuple[float, float, float],
-) -> dict:
-    """Сгенерировать фото комнаты со вписанным товаром через gpt-image-2.
-
-    Returns:
-        dict:
-            success: bool
-            image_bytes: bytes | None     — финальное PNG (если success)
-            error: str | None             — описание ошибки
-            error_type: str | None        — категория ('api', 'network', 'unsupported', 'unknown')
-            cost_estimate_usd: float
-            duration_sec: int
-            model: str
-            quality: str
-            size: str
-    """
-    start = time.time()
-    result: dict = {
+def _empty_result() -> dict:
+    return {
         "success": False,
         "image_bytes": None,
         "error": None,
@@ -116,43 +88,18 @@ async def generate_room_with_product(
         "size": None,
     }
 
-    # 1. Скачиваем обе картинки с 0x0.st (gpt-image edit не принимает URL — только файлы)
-    try:
-        scene_bytes = await _download_image(scene_url)
-        product_bytes = await _download_image(product_url)
-    except Exception as e:  # noqa: BLE001
-        result["error"] = f"Не удалось скачать картинки: {e}"
-        result["error_type"] = "network"
-        result["duration_sec"] = int(time.time() - start)
-        logger.exception("Download failed: %s", e)
-        return result
 
-    # 2. Подбираем размер выхода по ориентации сцены
-    size = _detect_output_size(scene_bytes)
-    result["size"] = size
+async def _call_edit_with_fallback(
+    client: AsyncOpenAI,
+    images_payload: list,
+    prompt: str,
+    size: str,
+    result: dict,
+) -> tuple[bool, object | None]:
+    """Вызов client.images.edit с fallback на gpt-image-1.5. Заполняет result.
 
-    prompt = GENERATION.format(
-        to_remove_en=to_remove_en,
-        to_remove_ru=to_remove_ru,
-        to_add_en=to_add_en,
-        to_add_ru=to_add_ru,
-        ceiling_cm=ceiling_cm,
-        room_description=room_description or "не указано",
-        prod_w=int(product_dims_cm[0]),
-        prod_d=int(product_dims_cm[1]),
-        prod_h=int(product_dims_cm[2]),
-    )
-
-    # 3. Вызов /v1/images/edits через gpt-image-2
-    client = _build_client()
-
-    # SDK ожидает FileTypes (bytes / tuple(filename, bytes, content_type) / IO).
-    # Используем tuple — самый надёжный формат.
-    images_payload = [
-        ("scene.png", scene_bytes, "image/png"),
-        ("product.png", product_bytes, "image/png"),
-    ]
-
+    Returns (ok, response). Если ok=False — ошибка уже записана в result.
+    """
     try:
         response = await client.images.edit(
             model=IMAGE_MODEL,
@@ -163,9 +110,9 @@ async def generate_room_with_product(
             size=size,
             n=1,
         )
+        return True, response
     except APIError as e:
         err_msg = str(e)
-        # Если модель недоступна — попробуем gpt-image-1.5
         if "model" in err_msg.lower() and ("not found" in err_msg.lower() or "does not exist" in err_msg.lower()):
             logger.warning("Model %s недоступна, пробую gpt-image-1.5: %s", IMAGE_MODEL, e)
             try:
@@ -179,55 +126,101 @@ async def generate_room_with_product(
                     n=1,
                 )
                 result["model"] = "gpt-image-1.5"
+                return True, response
             except APIError as e2:
                 result["error"] = f"OpenAI API: {e2}"
                 result["error_type"] = "api"
-                result["duration_sec"] = int(time.time() - start)
                 logger.exception("Fallback to gpt-image-1.5 также упал: %s", e2)
-                return result
-        else:
-            result["error"] = f"OpenAI API: {e}"
-            result["error_type"] = "api"
-            result["duration_sec"] = int(time.time() - start)
-            logger.exception("OpenAI API error: %s", e)
-            return result
+                return False, None
+        result["error"] = f"OpenAI API: {e}"
+        result["error_type"] = "api"
+        logger.exception("OpenAI API error: %s", e)
+        return False, None
     except Exception as e:  # noqa: BLE001
         result["error"] = f"{type(e).__name__}: {e}"
         result["error_type"] = "unknown"
-        result["duration_sec"] = int(time.time() - start)
-        logger.exception("Unexpected error in generation: %s", e)
-        return result
+        logger.exception("Unexpected error in edit call: %s", e)
+        return False, None
 
-    # 4. Извлечь картинку из ответа
+
+async def _extract_image_from_response(response, result: dict) -> bytes | None:
+    """Достать байты картинки из response.data[0] (b64_json или url)."""
     if not response.data:
         result["error"] = "OpenAI вернул пустой data"
         result["error_type"] = "api"
-        result["duration_sec"] = int(time.time() - start)
-        return result
-
+        return None
     item = response.data[0]
-    image_bytes: bytes | None = None
-
-    # gpt-image-2 обычно возвращает b64_json, но может и url
     if getattr(item, "b64_json", None):
         try:
-            image_bytes = base64.b64decode(item.b64_json)
+            return base64.b64decode(item.b64_json)
         except Exception as e:  # noqa: BLE001
             result["error"] = f"Не удалось декодировать b64: {e}"
             result["error_type"] = "api"
-            result["duration_sec"] = int(time.time() - start)
-            return result
-    elif getattr(item, "url", None):
+            return None
+    if getattr(item, "url", None):
         try:
-            image_bytes = await _download_image(item.url)
+            return await _download_image(item.url)
         except Exception as e:  # noqa: BLE001
-            result["error"] = f"Не удалось скачать результат с URL: {e}"
+            result["error"] = f"Не удалось скачать результат: {e}"
             result["error_type"] = "network"
-            result["duration_sec"] = int(time.time() - start)
-            return result
-    else:
-        result["error"] = "В ответе нет ни b64_json, ни url"
-        result["error_type"] = "api"
+            return None
+    result["error"] = "В ответе нет ни b64_json, ни url"
+    result["error_type"] = "api"
+    return None
+
+
+async def generate_removal_with_dimensions(
+    scene_url: str,
+    to_remove: str,
+    to_add_with_placement: str,
+    ceiling_cm: int,
+    room_description: str,
+    slot_dims: dict,
+) -> dict:
+    """ЭТАП А: убрать объекты + нарисовать на картинке размеры свободного места.
+
+    Args:
+        slot_dims: словарь из estimate_post_removal_slot (free_area_after_removal)
+            с ключами width_cm, depth_cm, height_cm.
+
+    Returns: dict как у generate_room_with_product.
+    """
+    start = time.time()
+    result = _empty_result()
+
+    try:
+        scene_bytes = await _download_image(scene_url)
+    except Exception as e:  # noqa: BLE001
+        result["error"] = f"Не удалось скачать фото комнаты: {e}"
+        result["error_type"] = "network"
+        result["duration_sec"] = int(time.time() - start)
+        logger.exception("Download failed (removal stage): %s", e)
+        return result
+
+    size = _detect_output_size(scene_bytes)
+    result["size"] = size
+
+    free_area = slot_dims.get("free_area_after_removal") or slot_dims
+    prompt = REMOVAL_WITH_DIMENSIONS.format(
+        to_remove=to_remove,
+        to_add_with_placement=to_add_with_placement or "в подходящем месте",
+        ceiling_cm=ceiling_cm,
+        room_description=room_description or "не указано",
+        width=int(free_area.get("width_cm", 200)),
+        depth=int(free_area.get("depth_cm", 90)),
+        height=int(free_area.get("height_cm", 220)),
+    )
+
+    images_payload = [("scene.png", scene_bytes, "image/png")]
+    client = _build_client()
+
+    ok, response = await _call_edit_with_fallback(client, images_payload, prompt, size, result)
+    if not ok:
+        result["duration_sec"] = int(time.time() - start)
+        return result
+
+    image_bytes = await _extract_image_from_response(response, result)
+    if image_bytes is None:
         result["duration_sec"] = int(time.time() - start)
         return result
 
@@ -235,10 +228,80 @@ async def generate_room_with_product(
     result["image_bytes"] = image_bytes
     result["cost_estimate_usd"] = _estimate_cost(result["model"], IMAGE_QUALITY)
     result["duration_sec"] = int(time.time() - start)
-
     logger.info(
-        "Generation OK: model=%s, quality=%s, size=%s, %d сек, ~$%.3f",
-        result["model"], IMAGE_QUALITY, size,
-        result["duration_sec"], result["cost_estimate_usd"],
+        "Stage A (removal + dimensions) OK: %d сек, ~$%.3f, size=%s",
+        result["duration_sec"], result["cost_estimate_usd"], size,
+    )
+    return result
+
+
+async def generate_room_with_product(
+    scene_url: str,
+    product_url: str,
+    to_remove: str,
+    to_add_with_placement: str,
+    ceiling_cm: int,
+    room_description: str,
+    final_slot_dims: dict,
+    product_dims_cm: tuple[float, float, float],
+) -> dict:
+    """ЭТАП Б: финальная генерация — берём ИСХОДНОЕ фото комнаты + фото товара,
+    убираем то что просили, ставим новый товар с учётом подтверждённых размеров.
+
+    Returns: dict как у _empty_result.
+    """
+    start = time.time()
+    result = _empty_result()
+
+    try:
+        scene_bytes = await _download_image(scene_url)
+        product_bytes = await _download_image(product_url)
+    except Exception as e:  # noqa: BLE001
+        result["error"] = f"Не удалось скачать картинки: {e}"
+        result["error_type"] = "network"
+        result["duration_sec"] = int(time.time() - start)
+        logger.exception("Download failed (final stage): %s", e)
+        return result
+
+    size = _detect_output_size(scene_bytes)
+    result["size"] = size
+
+    slot = final_slot_dims.get("free_area_after_removal") or final_slot_dims
+    prompt = GENERATION.format(
+        to_remove=to_remove,
+        to_add_with_placement=to_add_with_placement,
+        ceiling_cm=ceiling_cm,
+        room_description=room_description or "не указано",
+        slot_w=int(slot.get("width_cm", 200)),
+        slot_d=int(slot.get("depth_cm", 90)),
+        slot_h=int(slot.get("height_cm", 220)),
+        prod_w=int(product_dims_cm[0]),
+        prod_d=int(product_dims_cm[1]),
+        prod_h=int(product_dims_cm[2]),
+    )
+
+    images_payload = [
+        ("scene.png", scene_bytes, "image/png"),
+        ("product.png", product_bytes, "image/png"),
+    ]
+    client = _build_client()
+
+    ok, response = await _call_edit_with_fallback(client, images_payload, prompt, size, result)
+    if not ok:
+        result["duration_sec"] = int(time.time() - start)
+        return result
+
+    image_bytes = await _extract_image_from_response(response, result)
+    if image_bytes is None:
+        result["duration_sec"] = int(time.time() - start)
+        return result
+
+    result["success"] = True
+    result["image_bytes"] = image_bytes
+    result["cost_estimate_usd"] = _estimate_cost(result["model"], IMAGE_QUALITY)
+    result["duration_sec"] = int(time.time() - start)
+    logger.info(
+        "Stage B (final placement) OK: model=%s, %d сек, ~$%.3f, size=%s",
+        result["model"], result["duration_sec"], result["cost_estimate_usd"], size,
     )
     return result

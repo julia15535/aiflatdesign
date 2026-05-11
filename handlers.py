@@ -20,11 +20,10 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import BufferedInputFile, CallbackQuery, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-from ai.generation import generate_room_with_product
-from ai.object_mapping import known_examples, to_english
+from ai.generation import generate_removal_with_dimensions, generate_room_with_product
 from ai.preprocessing import preprocess_image
 from ai.quality_check import check_product_quality, check_scene_quality
-from ai.scene_analysis import estimate_slot_dimensions
+from ai.scene_analysis import estimate_post_removal_slot
 from ai.size_check import compare_product_to_slot
 from db import count_recent_generations, log_generation, log_session, touch_user
 from states import GenStates
@@ -248,15 +247,16 @@ async def receive_room_info(message: Message, state: FSMContext) -> None:
     await _ask_to_remove(message, state)
 
 
-# --- Что убрать и что добавить ---
+# --- Что убрать и что добавить (свободный текст, без словаря) ---
 
 
 async def _ask_to_remove(message: Message, state: FSMContext) -> None:
-    examples = ", ".join(known_examples(8))
     await message.answer(
         "🗑 Что УБРАТЬ из комнаты?\n\n"
-        f"Например: {examples}.\n\n"
-        "Пиши на русском, одной фразой."
+        "Опиши свободно. Можно несколько вещей. Например:\n"
+        "• «диван и журнальный столик»\n"
+        "• «весь старый шкаф около окна»\n"
+        "• «стулья и стол, а пол почистить»"
     )
     await state.set_state(GenStates.waiting_to_remove)
 
@@ -266,25 +266,21 @@ async def receive_to_remove(message: Message, state: FSMContext) -> None:
     if not message.text:
         return
     raw = message.text.strip()
-    if not raw or len(raw) > 60:
-        await message.answer("Не понял. Напиши проще, например «диван», «стол», «кресло».")
+    if not raw or len(raw) > 300:
+        await message.answer("Опиши коротко (до 300 символов).")
         return
-    to_remove_en, to_remove_ru, known = to_english(raw)
-    if not known:
-        await message.answer(
-            f"⚠️ «{raw}» — не нашёл в словаре, попробую угадать."
-        )
-    await state.update_data(to_remove_en=to_remove_en, to_remove_ru=to_remove_ru)
-    await message.answer(f"✓ Убираем: {to_remove_ru}")
+    await state.update_data(to_remove=raw)
+    await message.answer(f"✓ Убираем: {raw}")
     await _ask_to_add(message, state)
 
 
 async def _ask_to_add(message: Message, state: FSMContext) -> None:
-    examples = ", ".join(known_examples(8))
     await message.answer(
-        "✨ Что ПОСТАВИТЬ вместо?\n\n"
-        f"Например: {examples}.\n\n"
-        "Пиши на русском, одной фразой."
+        "✨ Что ПОСТАВИТЬ и КУДА?\n\n"
+        "Опиши свободно. Например:\n"
+        "• «шкаф в угол около окна»\n"
+        "• «диван у дальней стены»\n"
+        "• «обеденный стол со стульями в центре»"
     )
     await state.set_state(GenStates.waiting_to_add)
 
@@ -294,18 +290,183 @@ async def receive_to_add(message: Message, state: FSMContext) -> None:
     if not message.text:
         return
     raw = message.text.strip()
-    if not raw or len(raw) > 60:
-        await message.answer("Не понял. Напиши проще.")
+    if not raw or len(raw) > 300:
+        await message.answer("Опиши коротко (до 300 символов).")
         return
-    to_add_en, to_add_ru, known = to_english(raw)
-    if not known:
-        await message.answer(
-            f"⚠️ «{raw}» — не нашёл в словаре, попробую угадать."
-        )
-    await state.update_data(to_add_en=to_add_en, to_add_ru=to_add_ru)
+    await state.update_data(to_add_with_placement=raw)
+    await message.answer(f"✓ Поставим: {raw}")
+    await _run_stage_a(message, state)
+
+
+async def _run_stage_a(message: Message, state: FSMContext) -> None:
+    """ЭТАП А: оценить размер свободного места + сгенерировать промежуточную картинку."""
+    data = await state.get_data()
+    scene_url = data["scene_url"]
+    to_remove = data["to_remove"]
+    to_add_with_placement = data["to_add_with_placement"]
+    ceiling_cm = data.get("ceiling_cm") or 270
+    room_description = data.get("room_description") or ""
+
     await message.answer(
-        f"✓ Добавляем: {to_add_ru}\n\n"
-        "Загрузи фото товара (как в каталоге — на белом фоне, один предмет)."
+        "⏳ Оцениваю размер свободного места и убираю с фото то что ты попросил...\n"
+        "Это ~30 секунд."
+    )
+
+    slot = await estimate_post_removal_slot(
+        scene_url=scene_url,
+        to_remove=to_remove,
+        to_add_with_placement=to_add_with_placement,
+        ceiling_cm=ceiling_cm,
+        room_description=room_description,
+    )
+    await state.update_data(estimated_slot=slot)
+
+    image_result = await generate_removal_with_dimensions(
+        scene_url=scene_url,
+        to_remove=to_remove,
+        to_add_with_placement=to_add_with_placement,
+        ceiling_cm=ceiling_cm,
+        room_description=room_description,
+        slot_dims=slot,
+    )
+
+    if not image_result["success"]:
+        await message.answer(
+            f"❌ Не получилось сделать промежуточную картинку: "
+            f"{image_result.get('error', 'неизвестная ошибка')}\n\n"
+            "Попробуй /start с другим фото."
+        )
+        await state.clear()
+        return
+
+    free_area = slot.get("free_area_after_removal") or {}
+    w = free_area.get("width_cm", "?")
+    d = free_area.get("depth_cm", "?")
+    h = free_area.get("height_cm", "?")
+    confidence = slot.get("confidence", "?")
+    reasoning = slot.get("reasoning") or ""
+
+    caption_lines = [
+        "Вот как будет выглядеть комната без того что попросил убрать.",
+        "На фото нарисованы линии и подписи с размерами.",
+        "",
+        "Размеры свободного места:",
+        f"• Ширина: {w} см",
+        f"• Глубина: {d} см",
+        f"• Высота: {h} см",
+        f"(точность оценки: {confidence})",
+    ]
+    if reasoning:
+        caption_lines.append("")
+        caption_lines.append(f"💭 {reasoning}")
+
+    photo = BufferedInputFile(image_result["image_bytes"], filename="stage_a.png")
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✅ Размеры правильные", callback_data="slot:confirm")
+    kb.button(text="✏️ Поправлю", callback_data="slot:edit")
+    kb.adjust(2)
+
+    await message.answer_photo(photo, caption="\n".join(caption_lines), reply_markup=kb.as_markup())
+    await state.set_state(GenStates.confirming_slot_dimensions)
+
+
+@router.callback_query(F.data == "slot:confirm", GenStates.confirming_slot_dimensions)
+async def slot_confirm(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    if isinstance(callback.message, Message):
+        await callback.message.answer(
+            "Принято. Теперь загрузи фото товара (как в каталоге — на белом фоне)."
+        )
+    await state.set_state(GenStates.waiting_product_photo)
+
+
+@router.callback_query(F.data == "slot:edit", GenStates.confirming_slot_dimensions)
+async def slot_edit(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    if isinstance(callback.message, Message):
+        await callback.message.answer(
+            "Напиши правильные размеры свободного места в сантиметрах.\n"
+            "Пример: «ширина 230, глубина 80, высота 240»\n"
+            "Или коротко: «230 на 80 на 240»"
+        )
+    await state.set_state(GenStates.editing_slot_dimensions)
+
+
+_DIM_LABEL_RE = re.compile(
+    r"(ширина|шир|глубина|глуб|высота|выс)\s*[:=\s]?\s*(\d+(?:[.,]\d+)?)",
+    re.IGNORECASE,
+)
+_DIM_TRIPLE_RE = re.compile(r"(\d+(?:[.,]\d+)?)\s*(?:на|x|х|×|\*)\s*(\d+(?:[.,]\d+)?)\s*(?:на|x|х|×|\*)\s*(\d+(?:[.,]\d+)?)", re.IGNORECASE)
+
+
+def _parse_slot_edit(text: str, current: dict) -> dict | None:
+    """Парсит правки размеров. Возвращает новый dict free_area_after_removal или None."""
+    cur_w = int(current.get("width_cm", 0)) if current else 0
+    cur_d = int(current.get("depth_cm", 0)) if current else 0
+    cur_h = int(current.get("height_cm", 0)) if current else 0
+
+    # Сначала пробуем формат «230 на 80 на 240»
+    triple = _DIM_TRIPLE_RE.search(text)
+    if triple:
+        w, d, h = (int(round(float(v.replace(",", ".")))) for v in triple.groups())
+        return {"width_cm": w, "depth_cm": d, "height_cm": h}
+
+    # Формат с метками
+    found: dict[str, int] = {}
+    for label, num in _DIM_LABEL_RE.findall(text):
+        value = int(round(float(num.replace(",", "."))))
+        label_low = label.lower()
+        if label_low.startswith("шир"):
+            found["width_cm"] = value
+        elif label_low.startswith("глуб"):
+            found["depth_cm"] = value
+        elif label_low.startswith("выс"):
+            found["height_cm"] = value
+    if not found:
+        return None
+
+    return {
+        "width_cm": found.get("width_cm", cur_w),
+        "depth_cm": found.get("depth_cm", cur_d),
+        "height_cm": found.get("height_cm", cur_h),
+    }
+
+
+@router.message(GenStates.editing_slot_dimensions, F.text)
+async def receive_slot_edit(message: Message, state: FSMContext) -> None:
+    if not message.text:
+        return
+    data = await state.get_data()
+    estimated_slot = data.get("estimated_slot") or {}
+    current = estimated_slot.get("free_area_after_removal") or {}
+
+    new_dims = _parse_slot_edit(message.text, current)
+    if not new_dims:
+        await message.answer(
+            "Не понял размеры. Напиши с метками («ширина 230, высота 240») или «230 на 80 на 240»."
+        )
+        return
+
+    # Sanity check
+    for axis, val in new_dims.items():
+        if not (10 <= val <= 600):
+            await message.answer(f"{axis} = {val} — не похоже на правду. Жду размеры в см между 10 и 600.")
+            return
+
+    # Сохраняем как final_slot
+    final_slot = {
+        "free_area_after_removal": new_dims,
+        "confidence": "user_specified",
+        "reasoning": "размеры указаны пользователем",
+    }
+    await state.update_data(estimated_slot=final_slot)
+
+    await message.answer(
+        f"✓ Записал размеры:\n"
+        f"• Ширина: {new_dims['width_cm']} см\n"
+        f"• Глубина: {new_dims['depth_cm']} см\n"
+        f"• Высота: {new_dims['height_cm']} см\n\n"
+        "Теперь загрузи фото товара (как в каталоге — на белом фоне)."
     )
     await state.set_state(GenStates.waiting_product_photo)
 
@@ -400,45 +561,35 @@ async def receive_product_dims(message: Message, state: FSMContext) -> None:
 
 
 async def _run_pre_flight_check(message: Message, state: FSMContext) -> None:
-    """Оценка слота под добавляемый объект + сравнение с размерами товара."""
+    """Сравниваем размеры товара с подтверждённым слотом (estimated_slot)."""
     data = await state.get_data()
-    scene_url = data.get("scene_url")
-    to_add_en = data.get("to_add_en") or "furniture"
-    to_add_ru = data.get("to_add_ru") or "мебель"
-    ceiling_cm = data.get("ceiling_cm") or 270
-    room_description = data.get("room_description") or ""
+    estimated_slot = data.get("estimated_slot") or {}
+    free_area = estimated_slot.get("free_area_after_removal") or {}
     product_dims = data["product_dims"]
 
-    await message.answer("⏳ Проверяю влезет ли товар (5-10 секунд)...")
-
-    slot = await estimate_slot_dimensions(
-        scene_url=scene_url,
-        target_en=to_add_en,
-        target_ru=to_add_ru,
-        ceiling_cm=ceiling_cm,
-        room_description=room_description,
-    )
-
-    # Если ИИ говорит «этот объект вообще нетипичен для такой комнаты» — предупреждаем
-    if slot.get("is_target_appropriate_for_room") is False:
-        appropriate_msg = slot.get("appropriate_explanation") or ""
-        if appropriate_msg:
-            await message.answer(f"⚠️ {appropriate_msg}")
+    # Формат который ждёт compare_product_to_slot: {"estimated_slot": {...}, "confidence": ...}
+    slot_for_compare = {
+        "estimated_slot": {
+            "width_cm": free_area.get("width_cm", 200),
+            "depth_cm": free_area.get("depth_cm", 90),
+            "height_cm": free_area.get("height_cm", 220),
+        },
+        "confidence": estimated_slot.get("confidence", "medium"),
+    }
 
     try:
-        size_check = compare_product_to_slot(product_dims, slot)
+        size_check = compare_product_to_slot(product_dims, slot_for_compare)
     except ValueError:
         logger.exception("Не удалось сравнить размеры")
-        await message.answer("❌ Не удалось оценить размеры. Запускаю как есть.")
-        await _finish(message, state, slot=slot, size_check=None)
+        await message.answer("❌ Не удалось проверить размеры. Запускаю генерацию как есть.")
+        await _finish(message, state, size_check=None)
         return
 
-    await state.update_data(slot=slot, size_check=size_check)
+    await state.update_data(size_check=size_check)
 
     verdict = size_check["verdict"]
     if verdict == "fits_ok":
-        await message.answer("✅ По моей оценке всё должно поместиться.")
-        await _finish(message, state, slot=slot, size_check=size_check)
+        await _finish(message, state, size_check=size_check)
         return
 
     # Marginal или doesnt_fit — кнопки
@@ -448,18 +599,16 @@ async def _run_pre_flight_check(message: Message, state: FSMContext) -> None:
 
     if verdict == "marginal":
         text = (
-            f"⚠️ По моей оценке твой {to_add_ru} `{int(p_len)}x{int(p_width)}x{int(p_height)}` "
-            f"примерно на {overrun:.0f}% больше места.\n\n"
-            f"В твоей комнате под {to_add_ru} обычно подходит ~"
-            f"{slot_dims['width']}x{slot_dims['depth']}x{slot_dims['height']} см.\n\n"
+            f"⚠️ Товар `{int(p_len)}x{int(p_width)}x{int(p_height)}` "
+            f"примерно на {overrun:.0f}% больше свободного места "
+            f"({slot_dims['width']}x{slot_dims['depth']}x{slot_dims['height']} см).\n\n"
             "Скорее всего будет тесновато. Что делаем?"
         )
     else:  # doesnt_fit
         text = (
-            f"❌ По моей оценке твой {to_add_ru} `{int(p_len)}x{int(p_width)}x{int(p_height)}` "
-            f"на {overrun:.0f}% больше места.\n\n"
-            f"В твоей комнате под {to_add_ru} подойдёт максимум ~"
-            f"{slot_dims['width']}x{slot_dims['depth']}x{slot_dims['height']} см.\n\n"
+            f"❌ Товар `{int(p_len)}x{int(p_width)}x{int(p_height)}` "
+            f"на {overrun:.0f}% больше свободного места "
+            f"({slot_dims['width']}x{slot_dims['depth']}x{slot_dims['height']} см).\n\n"
             "Возьми меньший размер или другой товар."
         )
 
@@ -477,12 +626,7 @@ async def size_proceed(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
     data = await state.get_data()
     if isinstance(callback.message, Message):
-        await callback.message.answer("Принял. Запускаю подбор...")
-        await _finish(
-            callback.message, state,
-            slot=data.get("slot"),
-            size_check=data.get("size_check"),
-        )
+        await _finish(callback.message, state, size_check=data.get("size_check"))
 
 
 @router.callback_query(F.data == "size:retry", GenStates.confirming_size_mismatch)
@@ -495,13 +639,12 @@ async def size_retry(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
 
 
-# --- Финал (заглушка генерации) ---
+# --- Финал: этап Б (реальная генерация с товаром) ---
 
 
 async def _finish(
     message: Message,
     state: FSMContext,
-    slot: dict | None,
     size_check: dict | None,
 ) -> None:
     data = await state.get_data()
@@ -517,49 +660,50 @@ async def _finish(
         await state.clear()
         return
 
-    # 2. Сохраняем сессию ДО генерации (если генерация упадёт — данные не потеряем)
+    estimated_slot = data.get("estimated_slot") or {}
+
+    # 2. Сохраняем сессию ДО генерации
     session_id = log_session(
         tg_user_id=user_id,
         scene_url=data.get("scene_url"),
         product_url=data.get("product_url"),
-        target_class=data.get("to_add_en"),
-        to_remove=data.get("to_remove_ru"),
-        to_add=data.get("to_add_ru"),
+        target_class=None,
+        to_remove=data.get("to_remove"),
+        to_add=data.get("to_add_with_placement"),
         room_dims_m=None,
         product_dims_cm=data.get("product_dims"),
         scene_quality=data.get("scene_qc"),
         product_quality=data.get("product_qc"),
         ceiling_height_cm=data.get("ceiling_cm"),
         room_description=data.get("room_description"),
-        slot_estimation=slot,
+        slot_estimation=estimated_slot,
         size_check=size_check,
     )
 
     await message.answer(
-        f"🎨 Генерирую фото комнаты с твоим {data.get('to_add_ru', 'товаром')}...\n"
-        "Это занимает примерно 20-40 секунд. Подожди немного."
+        "🎨 Готовлю финальное фото с твоим товаром...\n"
+        "Это ~30 секунд."
     )
 
-    # 3. Реальная генерация через gpt-image-2
+    # 3. Этап Б: финальная генерация
     product_dims = data.get("product_dims") or (100, 100, 100)
     result = await generate_room_with_product(
         scene_url=data["scene_url"],
         product_url=data["product_url"],
-        to_remove_en=data.get("to_remove_en") or "previous furniture",
-        to_remove_ru=data.get("to_remove_ru") or "предыдущая мебель",
-        to_add_en=data.get("to_add_en") or "furniture",
-        to_add_ru=data.get("to_add_ru") or "мебель",
+        to_remove=data.get("to_remove") or "",
+        to_add_with_placement=data.get("to_add_with_placement") or "",
         ceiling_cm=data.get("ceiling_cm") or 270,
         room_description=data.get("room_description") or "",
+        final_slot_dims=estimated_slot,
         product_dims_cm=product_dims,
     )
 
-    # 4. Логируем в generations (как успех, так и фейл)
+    # 4. Лог генерации
     log_generation(
         session_id=session_id,
         success=result["success"],
         error_type=result.get("error_type"),
-        result_url=None,  # не используем 0x0.st для результата — отправляем напрямую в TG
+        result_url=None,
         cost_usd=result.get("cost_estimate_usd"),
         duration_sec=result.get("duration_sec"),
         generation_meta={
@@ -567,14 +711,15 @@ async def _finish(
             "quality": result.get("quality"),
             "size": result.get("size"),
             "error": result.get("error"),
+            "stage": "final",
         },
     )
 
-    # 5. Отправляем результат пользователю
+    # 5. Отправляем результат
     if not result["success"]:
         await message.answer(
             f"❌ Не получилось сгенерировать: {result.get('error', 'неизвестная ошибка')}\n\n"
-            "Попробуй /start с другими фото или повтори чуть позже."
+            "Попробуй /start с другими фото."
         )
         await state.clear()
         return
