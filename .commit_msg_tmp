@@ -1,0 +1,16 @@
+Шаги 1+2: скелет бота и проверка качества фото
+
+- pyproject.toml: aiogram 3, openai 1.50+, replicate, Pillow, opencv-headless, scikit-image
+- db.py: SQLite со схемой users/sessions/generations, init_db, log_session
+- ai/prompts.py: промпты для QC сцены и товара
+- ai/preprocessing.py: ресайз картинок до 1280px
+- ai/quality_check.py: OpenAI vision проверка с fallback на proceed при ошибках
+- utils/storage.py: загрузка на 0x0.st с запасным catbox.moe
+- states.py: FSM состояния диалога
+- handlers.py: обработчики /start /cancel /help + полный диалог-flow
+- bot.py: entry-point с polling
+- Dockerfile: multi-stage build на python:3.11-slim с uv
+- docker-compose.yml: контейнер aiflatdesigner-bot, отдельная сеть, host.docker.internal
+- .dockerignore: исключения для билда
+
+В конце диалога заглушка — реальная генерация будет в Шагах 3-4.

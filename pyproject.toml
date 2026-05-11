@@ -1,0 +1,44 @@
+[project]
+name = "aiflatdesigner"
+version = "0.1.0"
+description = "Telegram bot for AI-powered furniture fitting into room photos"
+requires-python = ">=3.11"
+dependencies = [
+    # Telegram bot framework
+    "aiogram>=3.13.0",
+    # OpenAI (vision: quality check, scene analysis, product description)
+    "openai>=1.50.0",
+    # Replicate (FLUX Fill Pro, GroundedSAM, etc. — для шагов 3-5)
+    "replicate>=0.32.0",
+    # Image processing
+    "Pillow>=10.4.0",
+    "numpy>=1.26.0",
+    "opencv-python-headless>=4.10.0",
+    # SSIM (для шага 4 — валидация)
+    "scikit-image>=0.24.0",
+    # HTTP client
+    "httpx>=0.27.0",
+    # Config
+    "python-dotenv>=1.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "ruff>=0.6.0",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["bot", "db", "states", "handlers"]
+packages = ["ai", "utils"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+ignore = ["E501"]

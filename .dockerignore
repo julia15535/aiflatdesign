@@ -1,0 +1,45 @@
+.git
+.gitignore
+.gitattributes
+
+# Память и доки — не нужны в контейнере
+.memory_bank/
+memory_bank_reference/
+docs/
+README.md
+
+# Локальная среда
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Секреты и данные
+.env
+.env.local
+.env.*.local
+data/*.db
+data/*.db-journal
+data/results/
+data/test_inspirations/
+data/test_catalog/
+
+# Claude и редакторы
+.claude/
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Скрипты и временные файлы
+scripts/
+.commit_msg_tmp
+*.log

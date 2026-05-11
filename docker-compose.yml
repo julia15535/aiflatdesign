@@ -1,0 +1,20 @@
+services:
+  bot:
+    build: .
+    image: aiflatdesigner-bot:latest
+    container_name: aiflatdesigner-bot
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./data:/app/data
+    networks:
+      - aiflatdesigner-net
+    # Доступ к хостовому gptproxy (на :8089 локально на сервере)
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    # Никаких ports — Telegram long polling работает только по исходящим
+
+networks:
+  aiflatdesigner-net:
+    name: aiflatdesigner-net
+    driver: bridge
