@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 
-# ---------- Builder ----------
+# ---------- Builder: ставим зависимости в /opt/venv ----------
 FROM python:3.11-slim AS builder
 
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
@@ -9,15 +9,20 @@ ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
 
 WORKDIR /app
 
-# Ставим uv (быстрый менеджер пакетов)
+# uv (быстрый менеджер пакетов)
 COPY --from=ghcr.io/astral-sh/uv:0.5.4 /uv /uvx /usr/local/bin/
 
+# Копируем весь проект (нужно для setuptools build backend)
 COPY pyproject.toml ./
-# Создаём виртуальное окружение и ставим зависимости в /opt/venv
+COPY bot.py db.py states.py handlers.py ./
+COPY ai/ ./ai/
+COPY utils/ ./utils/
+
+# Создаём виртуальное окружение и ставим проект+зависимости
 RUN uv venv /opt/venv --python 3.11 && \
     VIRTUAL_ENV=/opt/venv uv pip install --no-cache .
 
-# ---------- Runtime ----------
+# ---------- Runtime: тонкий образ с venv + кодом ----------
 FROM python:3.11-slim AS runtime
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -33,7 +38,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
-# Виртуальное окружение из builder'а
+# venv из builder'а
 COPY --from=builder /opt/venv /opt/venv
 
 # Код приложения
@@ -41,7 +46,7 @@ COPY bot.py db.py states.py handlers.py ./
 COPY ai/ ./ai/
 COPY utils/ ./utils/
 
-# Создаём папку для данных (БД) с правами для non-root
+# Non-root user + папка для БД
 RUN useradd -m -u 1000 botuser && \
     mkdir -p /app/data && \
     chown -R botuser:botuser /app
