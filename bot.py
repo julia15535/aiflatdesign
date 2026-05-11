@@ -12,6 +12,8 @@ import sys
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
+from aiogram.client.session.aiohttp import AiohttpSession
+from aiogram.client.telegram import TelegramAPIServer
 from aiogram.fsm.storage.memory import MemoryStorage
 from dotenv import load_dotenv
 
@@ -19,6 +21,17 @@ from db import init_db
 from handlers import router
 
 logger = logging.getLogger(__name__)
+
+
+def _build_session() -> AiohttpSession | None:
+    """Если задан TG_API_BASE_URL — используем зеркало Telegram API
+    (для обхода блокировки api.telegram.org). Иначе — None (дефолт aiogram)."""
+    base = os.environ.get("TG_API_BASE_URL", "").strip()
+    if not base:
+        return None
+    server = TelegramAPIServer.from_base(base)
+    logger.info("Telegram API через зеркало: %s", base)
+    return AiohttpSession(api=server)
 
 
 async def main() -> None:
@@ -37,7 +50,12 @@ async def main() -> None:
 
     init_db()
 
-    bot = Bot(token=token, default=DefaultBotProperties(parse_mode=None))
+    session = _build_session()
+    bot = Bot(
+        token=token,
+        session=session,  # type: ignore[arg-type]  # None допустим — aiogram создаст дефолт
+        default=DefaultBotProperties(parse_mode=None),
+    )
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
 
