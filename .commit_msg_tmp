@@ -1,25 +1,32 @@
-Шаг 2.5: умный сбор размеров + pre-flight оценка влезет ли товар
+Шаг 3: реальная генерация через OpenAI gpt-image-2
 
-Новый поток диалога:
-- Заменили вопрос про размеры комнаты (5x4) на свободное описание + высота потолка
-- Объекты теперь спрашиваем на русском, маппим через ai/object_mapping.py
-- После размеров товара — pre-flight через OpenAI vision: ИИ оценивает размер места под объект
-- Сравнение с размерами товара даёт verdict: fits_ok / marginal / doesnt_fit
-- На грани и больше — показываем кнопки [Всё равно делать] / [Проверить размеры]
+Заменили заглушку _finish на реальный вызов /v1/images/edits с моделью
+gpt-image-2. Получаем фото комнаты со вписанным товаром одним запросом.
 
-Новые файлы:
-- ai/object_mapping.py — словарь русских названий мебели в английские
-- ai/scene_analysis.py — estimate_slot_dimensions через OpenAI с потолком как масштабом
-- ai/size_check.py — алгоритм сравнения товара со слотом
+Новый диалог:
+- Разделили "что заменить" на два вопроса: что УБРАТЬ (стол) и что ПОСТАВИТЬ (шкаф)
+- После размеров и pre-flight check — реальная генерация (20-30 сек)
+- Бот отправляет финальное фото пользователю в Telegram
 
-Обновления:
-- ai/prompts.py: добавлен SLOT_ESTIMATION промпт
-- states.py: waiting_room_dims -> waiting_room_info, добавлен confirming_size_mismatch
-- handlers.py: переписан флоу под новые шаги, парсинг потолка через regex
-- db.py: новые колонки sessions.ceiling_height_cm, room_description, slot_estimation_json, size_check_json + автомиграция через ALTER TABLE
+Новый код:
+- ai/generation.py: generate_room_with_product() через AsyncOpenAI.images.edit
+  - Скачивает фото с 0x0.st как bytes (SDK 2.36 не принимает URL)
+  - Динамический выбор размера выхода по ориентации сцены
+  - Fallback на gpt-image-1.5 если основная модель недоступна
+  - Возвращает image_bytes или error с типом ошибки
+- ai/prompts.py: добавлен GENERATION (английский, акцент на сохранение визуала + сцены)
+- handlers.py: обработчики waiting_to_remove + waiting_to_add, реальная генерация в _finish
+- states.py: waiting_target_class -> waiting_to_remove + waiting_to_add
+- db.py: колонки sessions.to_remove + to_add, функция log_generation()
+- .env.example: OPENAI_IMAGE_MODEL/QUALITY/INPUT_FIDELITY
 
-Память проекта дополнена:
-- .memory_bank/ai/object_mapping.md (новый)
-- .memory_bank/business/backlog_post_mvp.md (новый — идея с 5-10 фото по кругу)
-- .memory_bank/plans/day_2_smart_sizing.md (план шага)
-- обновлены: domain/states, bot/flow, ai/scene_analysis, ai/size_check, ai/prompts
+Параметры по умолчанию:
+- gpt-image-2, quality=medium ($0.024/картинку), input_fidelity=high
+- Размеры: 1536x1024 / 1024x1024 / 1024x1536 (по ориентации сцены)
+- Лимит: 5 успешных генераций в сутки на пользователя
+
+Память проекта:
+- DECISIONS.md: обоснование отказа от Replicate
+- ai/generation.md: переписано под gpt-image-2
+- _claude/PROJECT-STATE.md: фаза = Шаг 3
+- plans/day_3_openai_generation.md

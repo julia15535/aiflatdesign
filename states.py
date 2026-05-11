@@ -16,7 +16,8 @@ class GenStates(StatesGroup):
     # Основной flow
     waiting_scene = State()
     waiting_room_info = State()  # высота потолка + описание комнаты одним сообщением
-    waiting_target_class = State()
+    waiting_to_remove = State()  # что убрать из комнаты
+    waiting_to_add = State()  # что поставить вместо
     waiting_product_photo = State()
     waiting_product_dims = State()
     confirming_size_mismatch = State()  # после pre-flight check если на грани/не влезает

@@ -1,112 +1,97 @@
-# Stage 3: Generation (FLUX Fill Pro × N seeds)
+# Stage 3: Generation через OpenAI gpt-image-2
 
-Inpainting в маску слота с учётом фото товара (reference). Делаем `N=3` seeds, дальше Stage 4 валидирует и выбирает best.
+Финальная генерация — **один вызов** `client.images.edit(...)` с массивом из двух картинок (сцена + товар) и текстовым промптом.
 
-## Шаги
+Файл: `ai/generation.py`. Промпт: `GENERATION` в `ai/prompts.py`.
 
-### 1. Описание товара (vision)
-
-```python
-async def describe_product(product_url: str) -> str:
-    # GPT-5.4 Mini vision (low detail)
-    # → 50-60 слов английского описания товара
-```
-
-Промпт: "Опиши этот предмет мебели для AI image generation prompt. Включи: тип, цвет, материал/обивку, узор/паттерн, форму, стиль ножек/основания, особые детали. Кратко, до 60 слов, на английском, без preamble."
-
-### 2. Сборка prompt'а
-
-```
-"a {target_class} that matches the reference product exactly. "
-"{product_description}. "
-"{style} interior style, {lighting} lighting matching the room. "
-"photorealistic, sharp focus, high detail, magazine-quality interior photography. "
-"the {target_class} should fit naturally into the existing room geometry."
-```
-
-`{style}` и `{lighting}` берутся из `scene_analysis`. Если их нет — defaults (`modern`, `natural_daylight`).
-
-### 3. Fill Pro вызовы
-
-`N=3` параллельных вызовов с разными seeds (42, 43, 44). Каждый стоит ~$0.05.
-
-Параметры:
-- `image: scene_url`
-- `mask: mask_url` (из GroundedSAM)
-- `prompt: <собранный>`
-- `guidance: 30`
-- `num_inference_steps: 30`
-- `safety_tolerance: 2`
-- `output_format: "png"`
-- `seed: 42+i`
+## Контракт
 
 ```python
-candidates = []
-for i in range(n_seeds):
-    try:
-        gen = await generate_with_fill_pro(scene_url, mask_url, product_url,
-                                            target_class, product_desc, scene_analysis,
-                                            seed=42 + i)
-        v = await validate_result(gen, target_class, product_url, scene_url,
-                                   slot_bbox=slot_detection["bbox"])
-        candidates.append((v["wow_score"], gen, v))
-    except Exception as e:
-        logger.error(f"Generation failed seed={i}: {e}")
-        continue
+async def generate_room_with_product(
+    scene_url: str,
+    product_url: str,
+    to_remove_en: str,
+    to_remove_ru: str,
+    to_add_en: str,
+    to_add_ru: str,
+    ceiling_cm: int,
+    room_description: str,
+    product_dims_cm: tuple[float, float, float],
+) -> dict
 ```
 
-⚠️ Если все 3 seeds упали — fail с `all_seeds_failed`.
-
-### 4. Best-pick
-
+Возвращает:
 ```python
-candidates.sort(reverse=True, key=lambda x: x[0])
-_, best_url, best_val = candidates[0]
-variants = [c[1] for c in candidates[:3]]   # для логирования и UI
+{
+    "success": bool,
+    "image_bytes": bytes | None,  # PNG итоговой картинки
+    "error": str | None,
+    "error_type": "api" | "network" | "unknown" | None,
+    "cost_estimate_usd": float,
+    "duration_sec": int,
+    "model": "gpt-image-2",
+    "quality": "medium",
+    "size": "1536x1024" | "1024x1024" | "1024x1536",
+}
 ```
 
-## Параллелизм
+## Стратегия
 
-3 seeds должны идти через `asyncio.gather`, иначе общее время = 3 × 50 сек = 150 сек. С параллельностью — 50-60 сек.
+1. **Скачиваем обе картинки** с 0x0.st (или catbox) как bytes — SDK 2.36 принимает только файлы, не URL.
+2. **Выбираем размер выхода** по ориентации фото комнаты:
+   - Горизонтальное (ratio ≥ 1.25): `1536x1024`
+   - Вертикальное (ratio ≤ 0.8): `1024x1536`
+   - Иначе: `1024x1024`
+3. **Вызываем `client.images.edit`** с моделью `gpt-image-2`, `input_fidelity="high"`, `quality="medium"`.
+4. **Fallback на `gpt-image-1.5`** если основная модель недоступна (ошибка типа "model not found").
+5. **Извлекаем результат**: сначала `b64_json` (если есть), иначе скачиваем по `url`.
 
-Замечание: код выше показан последовательным. **Реализуем** параллельным через `asyncio.gather([generate+validate task] for each seed)`.
+## Параметры окружения
 
-## Reference товара
+| ENV | По умолчанию | Зачем |
+|---|---|---|
+| `OPENAI_IMAGE_MODEL` | `gpt-image-2` | Модель генерации. Можно переключить на `gpt-image-1.5`/`gpt-image-1-mini`. |
+| `OPENAI_IMAGE_QUALITY` | `medium` | `low` $0.006 / `medium` $0.024 / `high` $0.12 за картинку. |
+| `OPENAI_IMAGE_INPUT_FIDELITY` | `high` | `high` сохраняет визуал товара, `low` ускоряет/удешевляет. |
+| `OPENAI_BASE_URL` | (опц.) | Прокси gptproxy на сервере: `http://host.docker.internal:8089/gpt`. |
 
-⚠️ **FLUX Fill Pro в текущей версии не принимает product_url как reference напрямую.** В оригинальном коде MVP `product_url` принимается как параметр, но дальше передаётся **только** в prompt'е через текст `product_description`. Это сознательное решение:
-- Описание через vision Mini даёт более стабильный результат
-- Не требует FLUX Redux / IP-Adapter
-- Снижает variance
+## Промпт
 
-Если в день 4 на бенчмарке окажется что catalog_sim < 0.65 — добавить FLUX Redux (image-to-image conditioning) или IP-Adapter.
+Английский, акцент на двух вещах:
+- **Сохранение визуала товара** — exact color/pattern/shape/materials
+- **Сохранение целостности сцены** — стены/пол/потолок/окна/освещение не трогать
 
-## Negative prompt
+Полный текст в `ai/prompts.py` → `GENERATION`.
 
-Константный, не зависит от сцены/товара:
+## Стоимость и время
 
-```
-"deformed, distorted, blurry, cartoon, oversaturated, plastic look, "
-"fake, CGI, warped perspective, floating furniture, duplicated objects, "
-"melting furniture, mismatched scale, watermark, text, logo, low quality"
-```
-
-## Стоимость
-
-- Product description: $0.001
-- Fill Pro × 3: $0.15
-- **Итого Stage 3**: $0.151
-
-## Время
-
-- Описание товара (Mini low): ~2 сек
-- 3 Fill Pro параллельно: ~50-60 сек
-- **Итого Stage 3**: ~55-65 сек
+| Параметр | Значение |
+|---|---|
+| Цена за картинку (medium) | ~$0.024 |
+| Цена полного flow (QC + slot estimate + generation) | ~$0.033 |
+| Время генерации | 20-40 сек |
+| Время полного flow от пользователя | ~30-60 сек активного ожидания |
 
 ## Edge cases
 
 | Случай | Поведение |
 |---|---|
-| Replicate cold start (FLUX давно не использовался) | Первый seed может занять 90 сек. Логируем. Бот показывает "Первый запуск, ждём..." |
-| 1 из 3 seeds упал | Берём best из оставшихся 2 |
-| Все 3 упали | `error: "all_seeds_failed"` + retry-кнопка в боте |
-| Concurrent limit Replicate | Снижаем до `n_seeds=2` через env (`REPLICATE_PARALLEL_SEEDS`) |
+| OpenAI вернул `b64_json` | Декодируем base64 → bytes |
+| OpenAI вернул `url` | Скачиваем картинку → bytes |
+| Модель `gpt-image-2` недоступна для аккаунта (требуется верификация) | Fallback на `gpt-image-1.5` |
+| Сеть упала при скачивании reference | `error_type="network"`, пользователю сообщение, не повторяем (пусть /start) |
+| OpenAI rate limit (429) | `error_type="api"`, сообщение пользователю, не повторяем автоматически |
+| Картинка > поддерживаемого размера | `preprocess_image()` (ai/preprocessing.py) уже ужал до 1280px при загрузке |
+
+## Что НЕ делаем
+
+- ❌ Best-of-N (`n>1`) — для теста хватает одного варианта, удваивает цену
+- ❌ Кэширование результатов — каждый пользователь уникален
+- ❌ Промежуточные validation метрики (CLIP-I, SSIM, Grounding DINO) — это был план в Шаге 4 с Replicate, при gpt-image-2 решено отказаться
+
+## Связанные файлы
+
+- `ai/prompts.py::GENERATION` — текст промпта
+- `handlers.py::_finish` — вызов и отправка результата в Telegram
+- `db.py::log_generation` — сохранение факта генерации (успех/фейл, цена, длительность)
+- `.memory_bank/_claude/DECISIONS.md` — обоснование отказа от Replicate

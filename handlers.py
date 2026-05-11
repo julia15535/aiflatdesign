@@ -17,17 +17,20 @@ from typing import Final
 from aiogram import Bot, F, Router
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import BufferedInputFile, CallbackQuery, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
+from ai.generation import generate_room_with_product
 from ai.object_mapping import known_examples, to_english
 from ai.preprocessing import preprocess_image
 from ai.quality_check import check_product_quality, check_scene_quality
 from ai.scene_analysis import estimate_slot_dimensions
 from ai.size_check import compare_product_to_slot
-from db import log_session, touch_user
+from db import count_recent_generations, log_generation, log_session, touch_user
 from states import GenStates
 from utils.storage import upload_to_temp_storage
+
+DAILY_GENERATION_LIMIT = 5
 
 logger = logging.getLogger(__name__)
 
@@ -242,39 +245,66 @@ async def receive_room_info(message: Message, state: FSMContext) -> None:
         return
     await state.update_data(ceiling_cm=ceiling_cm, room_description=description)
     await message.answer(f"✓ Понял: потолок {ceiling_cm}см.")
-    await _ask_target_class(message, state)
+    await _ask_to_remove(message, state)
 
 
-# --- Объект для замены ---
+# --- Что убрать и что добавить ---
 
 
-async def _ask_target_class(message: Message, state: FSMContext) -> None:
-    examples = ", ".join(known_examples(10))
+async def _ask_to_remove(message: Message, state: FSMContext) -> None:
+    examples = ", ".join(known_examples(8))
     await message.answer(
-        "Что заменить в комнате?\n\n"
+        "🗑 Что УБРАТЬ из комнаты?\n\n"
         f"Например: {examples}.\n\n"
         "Пиши на русском, одной фразой."
     )
-    await state.set_state(GenStates.waiting_target_class)
+    await state.set_state(GenStates.waiting_to_remove)
 
 
-@router.message(GenStates.waiting_target_class, F.text)
-async def receive_target_class(message: Message, state: FSMContext) -> None:
+@router.message(GenStates.waiting_to_remove, F.text)
+async def receive_to_remove(message: Message, state: FSMContext) -> None:
     if not message.text:
         return
     raw = message.text.strip()
     if not raw or len(raw) > 60:
-        await message.answer("Не понял. Напиши проще, например «диван», «обеденный стол», «торшер».")
+        await message.answer("Не понял. Напиши проще, например «диван», «стол», «кресло».")
         return
-    target_en, target_ru, known = to_english(raw)
+    to_remove_en, to_remove_ru, known = to_english(raw)
     if not known:
         await message.answer(
-            f"⚠️ «{raw}» — не нашёл в моём словаре, попробую угадать. "
-            "Если не получится — напиши проще, например «диван» или «стол»."
+            f"⚠️ «{raw}» — не нашёл в словаре, попробую угадать."
         )
-    await state.update_data(target_en=target_en, target_ru=target_ru, target_known=known)
+    await state.update_data(to_remove_en=to_remove_en, to_remove_ru=to_remove_ru)
+    await message.answer(f"✓ Убираем: {to_remove_ru}")
+    await _ask_to_add(message, state)
+
+
+async def _ask_to_add(message: Message, state: FSMContext) -> None:
+    examples = ", ".join(known_examples(8))
     await message.answer(
-        f"✓ Заменяем: {target_ru}\n\n"
+        "✨ Что ПОСТАВИТЬ вместо?\n\n"
+        f"Например: {examples}.\n\n"
+        "Пиши на русском, одной фразой."
+    )
+    await state.set_state(GenStates.waiting_to_add)
+
+
+@router.message(GenStates.waiting_to_add, F.text)
+async def receive_to_add(message: Message, state: FSMContext) -> None:
+    if not message.text:
+        return
+    raw = message.text.strip()
+    if not raw or len(raw) > 60:
+        await message.answer("Не понял. Напиши проще.")
+        return
+    to_add_en, to_add_ru, known = to_english(raw)
+    if not known:
+        await message.answer(
+            f"⚠️ «{raw}» — не нашёл в словаре, попробую угадать."
+        )
+    await state.update_data(to_add_en=to_add_en, to_add_ru=to_add_ru)
+    await message.answer(
+        f"✓ Добавляем: {to_add_ru}\n\n"
         "Загрузи фото товара (как в каталоге — на белом фоне, один предмет)."
     )
     await state.set_state(GenStates.waiting_product_photo)
@@ -370,11 +400,11 @@ async def receive_product_dims(message: Message, state: FSMContext) -> None:
 
 
 async def _run_pre_flight_check(message: Message, state: FSMContext) -> None:
-    """Оценка слота через OpenAI vision + сравнение с размерами товара."""
+    """Оценка слота под добавляемый объект + сравнение с размерами товара."""
     data = await state.get_data()
     scene_url = data.get("scene_url")
-    target_en = data.get("target_en") or "furniture"
-    target_ru = data.get("target_ru") or "мебель"
+    to_add_en = data.get("to_add_en") or "furniture"
+    to_add_ru = data.get("to_add_ru") or "мебель"
     ceiling_cm = data.get("ceiling_cm") or 270
     room_description = data.get("room_description") or ""
     product_dims = data["product_dims"]
@@ -383,8 +413,8 @@ async def _run_pre_flight_check(message: Message, state: FSMContext) -> None:
 
     slot = await estimate_slot_dimensions(
         scene_url=scene_url,
-        target_en=target_en,
-        target_ru=target_ru,
+        target_en=to_add_en,
+        target_ru=to_add_ru,
         ceiling_cm=ceiling_cm,
         room_description=room_description,
     )
@@ -407,7 +437,7 @@ async def _run_pre_flight_check(message: Message, state: FSMContext) -> None:
 
     verdict = size_check["verdict"]
     if verdict == "fits_ok":
-        await message.answer("✅ По моей оценке всё должно поместиться. Запускаю подбор...")
+        await message.answer("✅ По моей оценке всё должно поместиться.")
         await _finish(message, state, slot=slot, size_check=size_check)
         return
 
@@ -418,17 +448,17 @@ async def _run_pre_flight_check(message: Message, state: FSMContext) -> None:
 
     if verdict == "marginal":
         text = (
-            f"⚠️ По моей оценке твой {target_ru} `{int(p_len)}x{int(p_width)}x{int(p_height)}` "
+            f"⚠️ По моей оценке твой {to_add_ru} `{int(p_len)}x{int(p_width)}x{int(p_height)}` "
             f"примерно на {overrun:.0f}% больше места.\n\n"
-            f"В твоей комнате под {target_ru} обычно подходит ~"
+            f"В твоей комнате под {to_add_ru} обычно подходит ~"
             f"{slot_dims['width']}x{slot_dims['depth']}x{slot_dims['height']} см.\n\n"
             "Скорее всего будет тесновато. Что делаем?"
         )
     else:  # doesnt_fit
         text = (
-            f"❌ По моей оценке твой {target_ru} `{int(p_len)}x{int(p_width)}x{int(p_height)}` "
+            f"❌ По моей оценке твой {to_add_ru} `{int(p_len)}x{int(p_width)}x{int(p_height)}` "
             f"на {overrun:.0f}% больше места.\n\n"
-            f"В твоей комнате под {target_ru} подойдёт максимум ~"
+            f"В твоей комнате под {to_add_ru} подойдёт максимум ~"
             f"{slot_dims['width']}x{slot_dims['depth']}x{slot_dims['height']} см.\n\n"
             "Возьми меньший размер или другой товар."
         )
@@ -477,11 +507,24 @@ async def _finish(
     data = await state.get_data()
     user_id = message.from_user.id if message.from_user else 0
 
+    # 1. Лимит 5 успешных генераций в сутки
+    recent = count_recent_generations(user_id, hours=24)
+    if recent >= DAILY_GENERATION_LIMIT:
+        await message.answer(
+            f"⚠️ Дневной лимит {DAILY_GENERATION_LIMIT} генераций исчерпан. "
+            "Возвращайся завтра — лимит обнулится."
+        )
+        await state.clear()
+        return
+
+    # 2. Сохраняем сессию ДО генерации (если генерация упадёт — данные не потеряем)
     session_id = log_session(
         tg_user_id=user_id,
         scene_url=data.get("scene_url"),
         product_url=data.get("product_url"),
-        target_class=data.get("target_en"),
+        target_class=data.get("to_add_en"),
+        to_remove=data.get("to_remove_ru"),
+        to_add=data.get("to_add_ru"),
         room_dims_m=None,
         product_dims_cm=data.get("product_dims"),
         scene_quality=data.get("scene_qc"),
@@ -493,11 +536,61 @@ async def _finish(
     )
 
     await message.answer(
-        f"✨ Принял всё что нужно! Сессия #{session_id} записана в базу.\n\n"
-        "🚧 На этом шаге генерация картинки ещё не реализована — это будет в Шагах 3-4.\n"
-        "Пока проверяем что весь диалог работает и предварительная оценка размеров корректна.\n\n"
-        "Команда /start чтобы прогнать ещё один сценарий."
+        f"🎨 Генерирую фото комнаты с твоим {data.get('to_add_ru', 'товаром')}...\n"
+        "Это занимает примерно 20-40 секунд. Подожди немного."
     )
+
+    # 3. Реальная генерация через gpt-image-2
+    product_dims = data.get("product_dims") or (100, 100, 100)
+    result = await generate_room_with_product(
+        scene_url=data["scene_url"],
+        product_url=data["product_url"],
+        to_remove_en=data.get("to_remove_en") or "previous furniture",
+        to_remove_ru=data.get("to_remove_ru") or "предыдущая мебель",
+        to_add_en=data.get("to_add_en") or "furniture",
+        to_add_ru=data.get("to_add_ru") or "мебель",
+        ceiling_cm=data.get("ceiling_cm") or 270,
+        room_description=data.get("room_description") or "",
+        product_dims_cm=product_dims,
+    )
+
+    # 4. Логируем в generations (как успех, так и фейл)
+    log_generation(
+        session_id=session_id,
+        success=result["success"],
+        error_type=result.get("error_type"),
+        result_url=None,  # не используем 0x0.st для результата — отправляем напрямую в TG
+        cost_usd=result.get("cost_estimate_usd"),
+        duration_sec=result.get("duration_sec"),
+        generation_meta={
+            "model": result.get("model"),
+            "quality": result.get("quality"),
+            "size": result.get("size"),
+            "error": result.get("error"),
+        },
+    )
+
+    # 5. Отправляем результат пользователю
+    if not result["success"]:
+        await message.answer(
+            f"❌ Не получилось сгенерировать: {result.get('error', 'неизвестная ошибка')}\n\n"
+            "Попробуй /start с другими фото или повтори чуть позже."
+        )
+        await state.clear()
+        return
+
+    image_bytes = result["image_bytes"]
+    photo = BufferedInputFile(image_bytes, filename="result.png")
+
+    caption_lines = [
+        f"✨ Готово! Сессия #{session_id}",
+        f"Заняло {result['duration_sec']}с",
+    ]
+    if size_check and size_check.get("verdict") != "fits_ok":
+        caption_lines.append(f"⚠️ Размер был на грани ({size_check.get('max_overrun_pct', 0):.0f}% больше места)")
+    caption_lines.append("\nКоманда /start — попробовать ещё раз.")
+
+    await message.answer_photo(photo, caption="\n".join(caption_lines))
     await state.clear()
 
 

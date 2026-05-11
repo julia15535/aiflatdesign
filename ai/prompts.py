@@ -98,6 +98,33 @@ SLOT_ESTIMATION = """Ты эксперт по интерьерам. По фот�
 """
 
 
-# Промпты для Шагов 3-4 (пока заглушки — добавлю в нужный момент)
-SCENE_ANALYSIS = ""  # TODO в Шаге 3
-PRODUCT_DESCRIPTION = ""  # TODO в Шаге 3
+GENERATION = """You are editing the first image (a room photo) to perform a furniture replacement.
+
+REMOVE: {to_remove_en} ({to_remove_ru}) currently in the room.
+ADD: a {to_add_en} ({to_add_ru}) that looks EXACTLY like the second image (reference product).
+
+Real-world context (use as scale reference):
+- Ceiling height: {ceiling_cm} cm
+- Room description: "{room_description}"
+- Product dimensions: {prod_w} x {prod_d} x {prod_h} cm
+
+CRITICAL VISUAL IDENTITY REQUIREMENTS:
+- The {to_add_en} MUST look exactly like the reference product (second image).
+- Preserve: exact color, exact pattern/texture, exact shape, exact materials, exact proportions, design details (legs, handles, finish, fabric).
+- DO NOT reinterpret, simplify, or change the product's appearance in any way.
+- The added furniture should look like the SAME piece from the reference, not a similar one.
+
+SCENE INTEGRITY REQUIREMENTS:
+- Keep the room's original walls, floor, ceiling, windows, doors, lighting, and perspective unchanged.
+- Keep all other furniture (not being replaced) unchanged in position and appearance.
+- The new product should have natural shadows, reflections, and perspective matching the room's existing lighting.
+- Photorealistic output. No text, watermark, or labels in the result.
+- The result should look like a real photograph of the same room.
+
+If the removed item is not clearly visible in the room (mentioned for context but not present in the photo), still add the new product in the most natural location.
+"""
+
+
+# Промпты для будущего расширения (Шаг 4 если потребуется)
+SCENE_ANALYSIS = ""  # TODO если решим вернуть GroundedSAM
+PRODUCT_DESCRIPTION = ""  # TODO если решим вернуть FLUX Fill Pro

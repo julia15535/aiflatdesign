@@ -54,6 +54,8 @@ def init_db() -> None:
                 scene_url TEXT,
                 product_url TEXT,
                 target_class TEXT,
+                to_remove TEXT,
+                to_add TEXT,
                 room_dims_m TEXT,
                 product_dims_cm TEXT,
                 ceiling_height_cm INTEGER,
@@ -104,6 +106,8 @@ def _ensure_columns(conn: sqlite3.Connection) -> None:
         "room_description": "TEXT",
         "slot_estimation_json": "TEXT",
         "size_check_json": "TEXT",
+        "to_remove": "TEXT",
+        "to_add": "TEXT",
     }
     existing = {row[1] for row in conn.execute("PRAGMA table_info(sessions)")}
     for col, col_type in needed_in_sessions.items():
@@ -155,6 +159,8 @@ def log_session(
     scene_url: str | None = None,
     product_url: str | None = None,
     target_class: str | None = None,
+    to_remove: str | None = None,
+    to_add: str | None = None,
     room_dims_m: tuple[float, float] | None = None,
     product_dims_cm: tuple[float, float, float] | None = None,
     scene_quality: dict | None = None,
@@ -171,17 +177,20 @@ def log_session(
             """
             INSERT INTO sessions
                 (tg_user_id, scene_url, product_url, target_class,
+                 to_remove, to_add,
                  room_dims_m, product_dims_cm,
                  ceiling_height_cm, room_description,
                  scene_quality_json, product_quality_json, scene_analysis_json,
                  slot_estimation_json, size_check_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 tg_user_id,
                 scene_url,
                 product_url,
                 target_class,
+                to_remove,
+                to_add,
                 json.dumps(list(room_dims_m)) if room_dims_m else None,
                 json.dumps(list(product_dims_cm)) if product_dims_cm else None,
                 ceiling_height_cm,
@@ -191,6 +200,37 @@ def log_session(
                 json.dumps(scene_analysis) if scene_analysis else None,
                 json.dumps(slot_estimation) if slot_estimation else None,
                 json.dumps(size_check) if size_check else None,
+            ),
+        )
+        return int(cur.lastrowid or 0)
+
+
+def log_generation(
+    session_id: int,
+    success: bool,
+    error_type: str | None = None,
+    result_url: str | None = None,
+    cost_usd: float | None = None,
+    duration_sec: int | None = None,
+    generation_meta: dict | None = None,
+) -> int:
+    """Сохранить факт генерации (успешной или нет). Возвращает id записи."""
+    with _connect() as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO generations
+                (session_id, success, error_type, result_url,
+                 cost_usd, duration_sec, validation_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                session_id,
+                1 if success else 0,
+                error_type,
+                result_url,
+                cost_usd,
+                duration_sec,
+                json.dumps(generation_meta) if generation_meta else None,
             ),
         )
         return int(cur.lastrowid or 0)
