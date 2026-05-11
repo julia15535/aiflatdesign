@@ -2,6 +2,61 @@
 
 Алгоритмическая проверка (без AI) — вписывается ли товар в слот по реальным размерам. Не блокирует pipeline жёстко: при marginal/doesnt_fit предлагает пользователю выбор.
 
+## Реализация в Шаге 2.5
+
+Файл: `ai/size_check.py`
+
+```python
+def compare_product_to_slot(
+    product_dims_cm: tuple[float, float, float],  # длина, ширина, высота
+    slot: dict,                                    # из estimate_slot_dimensions
+) -> dict
+```
+
+Маппинг осей: `product[0]→slot.width_cm`, `product[1]→slot.depth_cm`, `product[2]→slot.height_cm`.
+
+Возвращает:
+```python
+{
+    "verdict": "fits_ok" | "marginal" | "doesnt_fit",
+    "fits": bool,
+    "max_overrun_pct": 18.0,  # макс. превышение по любой оси
+    "breakdown": {
+        "width": {"product": 140, "slot": 120, "overrun_pct": 16.7},
+        "depth": {"product": 90, "slot": 80, "overrun_pct": 12.5},
+        "height": {"product": 76, "slot": 76, "overrun_pct": 0.0},
+    },
+    "slot_dims_cm": {"width": 120, "depth": 80, "height": 76},
+    "product_dims_cm": {"width": 140, "depth": 90, "height": 76},
+    "confidence": "medium",
+    "thresholds_used": {"ok": 10, "marginal": 25},
+}
+```
+
+## Пороги
+
+| Превышение | Вердикт | Что делает бот |
+|---|---|---|
+| ≤ 10% | `fits_ok` | Молча идёт в финал (генерация в Шаге 3-4) |
+| 10-25% | `marginal` | Показывает кнопки `[Всё равно попробовать]` / `[Проверить размеры]` |
+| > 25% | `doesnt_fit` | Сообщает «не влезет» + одна кнопка «Всё равно попробовать» |
+
+## Учёт confidence
+
+Если `slot.confidence == "low"` (ИИ не уверен в оценке) — пороги расширяются на +10%:
+- Threshold OK: 10% → 20%
+- Threshold Marginal: 25% → 35%
+
+Логика: не пугаем пользователя зря если сама оценка слабая.
+
+## Edge cases
+
+- **Slot некорректен** (не положительные числа) → `ValueError` ловится в handler, идём в финал без проверки
+- **Все размеры впритык** (overrun=9.9%) → fits_ok (граница включает)
+- **Один размер сильно больше других** (`200x50x50` стол при слоте 120x80x76) → max_overrun=66% от 200 vs 120 → doesnt_fit. Другие оси игнорируются — нам важен максимум.
+
+
+
 ## Входы / выходы
 
 ```python

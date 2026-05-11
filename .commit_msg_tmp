@@ -1,16 +1,25 @@
-Шаги 1+2: скелет бота и проверка качества фото
+Шаг 2.5: умный сбор размеров + pre-flight оценка влезет ли товар
 
-- pyproject.toml: aiogram 3, openai 1.50+, replicate, Pillow, opencv-headless, scikit-image
-- db.py: SQLite со схемой users/sessions/generations, init_db, log_session
-- ai/prompts.py: промпты для QC сцены и товара
-- ai/preprocessing.py: ресайз картинок до 1280px
-- ai/quality_check.py: OpenAI vision проверка с fallback на proceed при ошибках
-- utils/storage.py: загрузка на 0x0.st с запасным catbox.moe
-- states.py: FSM состояния диалога
-- handlers.py: обработчики /start /cancel /help + полный диалог-flow
-- bot.py: entry-point с polling
-- Dockerfile: multi-stage build на python:3.11-slim с uv
-- docker-compose.yml: контейнер aiflatdesigner-bot, отдельная сеть, host.docker.internal
-- .dockerignore: исключения для билда
+Новый поток диалога:
+- Заменили вопрос про размеры комнаты (5x4) на свободное описание + высота потолка
+- Объекты теперь спрашиваем на русском, маппим через ai/object_mapping.py
+- После размеров товара — pre-flight через OpenAI vision: ИИ оценивает размер места под объект
+- Сравнение с размерами товара даёт verdict: fits_ok / marginal / doesnt_fit
+- На грани и больше — показываем кнопки [Всё равно делать] / [Проверить размеры]
 
-В конце диалога заглушка — реальная генерация будет в Шагах 3-4.
+Новые файлы:
+- ai/object_mapping.py — словарь русских названий мебели в английские
+- ai/scene_analysis.py — estimate_slot_dimensions через OpenAI с потолком как масштабом
+- ai/size_check.py — алгоритм сравнения товара со слотом
+
+Обновления:
+- ai/prompts.py: добавлен SLOT_ESTIMATION промпт
+- states.py: waiting_room_dims -> waiting_room_info, добавлен confirming_size_mismatch
+- handlers.py: переписан флоу под новые шаги, парсинг потолка через regex
+- db.py: новые колонки sessions.ceiling_height_cm, room_description, slot_estimation_json, size_check_json + автомиграция через ALTER TABLE
+
+Память проекта дополнена:
+- .memory_bank/ai/object_mapping.md (новый)
+- .memory_bank/business/backlog_post_mvp.md (новый — идея с 5-10 фото по кругу)
+- .memory_bank/plans/day_2_smart_sizing.md (план шага)
+- обновлены: domain/states, bot/flow, ai/scene_analysis, ai/size_check, ai/prompts

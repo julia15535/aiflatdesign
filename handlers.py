@@ -1,6 +1,8 @@
 """Обработчики Telegram-бота.
 
-Шаг 1+2: скелет диалога + проверка качества фото через OpenAI.
+Шаги 1+2+2.5: скелет диалога + проверка качества фото + pre-flight оценка
+размеров места под товар через OpenAI vision.
+
 Реальная генерация картинки появится в Шагах 3-4.
 
 Подробнее: .memory_bank/bot/handlers.md, .memory_bank/bot/flow.md
@@ -9,6 +11,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from typing import Final
 
 from aiogram import Bot, F, Router
@@ -17,8 +20,11 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
+from ai.object_mapping import known_examples, to_english
 from ai.preprocessing import preprocess_image
 from ai.quality_check import check_product_quality, check_scene_quality
+from ai.scene_analysis import estimate_slot_dimensions
+from ai.size_check import compare_product_to_slot
 from db import log_session, touch_user
 from states import GenStates
 from utils.storage import upload_to_temp_storage
@@ -29,30 +35,65 @@ router = Router()
 
 # --- Парсеры пользовательского ввода ---
 
-_SKIP_WORDS: Final[frozenset[str]] = frozenset({"не знаю", "skip", "нет", "не", "no"})
+_SKIP_WORDS: Final[frozenset[str]] = frozenset({"не знаю", "skip", "нет", "не"})
+
+# Регулярки для извлечения высоты потолка из произвольного текста.
+# Захватываем число (целое или дробное) + единицу (см|cm|м|m|мм|mm|метров|метра|метр).
+_CEILING_RE = re.compile(
+    r"(\d+(?:[.,]\d+)?)\s*(см|cm|мм|mm|метров|метра|метр|м|m)\b",
+    re.IGNORECASE,
+)
 
 
-def _parse_room_dims(text: str) -> tuple[float, float] | None:
-    """Парсит '5x4', '5x4', '5×4'. Возвращает None если 'не знаю'. Кидает ValueError при бреде."""
-    text = text.strip().lower()
-    if text in _SKIP_WORDS:
+def _parse_ceiling_height(text: str) -> int | None:
+    """Извлечь высоту потолка из произвольного текста.
+
+    Возвращает высоту в см. Если не нашли — None.
+    """
+    matches = _CEILING_RE.findall(text)
+    if not matches:
         return None
-    cleaned = text.replace("х", "x").replace("×", "x").replace("*", "x")
-    parts = cleaned.split("x")
-    if len(parts) != 2:
-        raise ValueError("ожидаем два числа через 'x'")
-    a, b = float(parts[0]), float(parts[1])
-    if not (1 <= a <= 30 and 1 <= b <= 30):
-        raise ValueError("размеры должны быть в метрах в диапазоне 1-30")
-    return (a, b)
+    # Берём первое совпадение. Если их несколько (напр. «250см и стены 4м»)
+    # — берём первое, потому что оно скорее всего про потолок (фраза начинается с него)
+    num_str, unit = matches[0]
+    num = float(num_str.replace(",", "."))
+    unit_lower = unit.lower()
+    if unit_lower in ("см", "cm"):
+        cm = num
+    elif unit_lower in ("мм", "mm"):
+        cm = num / 10
+    else:  # м, m, метров, метра, метр
+        cm = num * 100
+    cm_int = int(round(cm))
+    # Sanity check: потолок 150-500 см
+    if not (150 <= cm_int <= 500):
+        return None
+    return cm_int
+
+
+def _parse_room_info(text: str) -> tuple[int, str]:
+    """Парсит ответ «опиши комнату и потолок одним сообщением».
+
+    Returns:
+        (ceiling_cm, room_description) — описание = исходный текст без потолка-фразы.
+
+    Raises:
+        ValueError: если потолок не нашли.
+    """
+    ceiling_cm = _parse_ceiling_height(text)
+    if ceiling_cm is None:
+        raise ValueError("высота потолка не найдена")
+    # Описание = исходный текст. Не вычищаем фразу про потолок — это контекст для ИИ.
+    description = text.strip()
+    return ceiling_cm, description
 
 
 def _parse_product_dims(text: str) -> tuple[float, float, float] | None:
-    """Парсит '220x90x85'. Возвращает None если 'не знаю'. Кидает ValueError."""
+    """Парсит '220x90x85'. Возвращает None если 'не знаю'. Кидает ValueError при бреде."""
     text = text.strip().lower()
     if text in _SKIP_WORDS:
         return None
-    cleaned = text.replace("х", "x").replace("×", "x").replace("*", "x")
+    cleaned = text.replace("х", "x").replace("×", "x").replace("*", "x").replace(" ", "")
     parts = cleaned.split("x")
     if len(parts) != 3:
         raise ValueError("ожидаем три числа через 'x'")
@@ -71,10 +112,9 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
     if message.from_user:
         touch_user(message.from_user.id, message.from_user.username)
     await message.answer(
-        "👋 Привет! Я помогу подобрать как мебель из каталога будет смотреться в твоей комнате.\n\n"
-        "📷 Загрузи **фото комнаты** (хорошо освещённое, видна большая часть комнаты).\n\n"
+        "Привет! Я подбираю как мебель из каталога будет смотреться в твоей комнате.\n\n"
+        "Загрузи фото комнаты (нормальное освещение, видна большая часть).\n\n"
         "Команды: /cancel — отменить, /help — подсказка.",
-        parse_mode="Markdown",
     )
     await state.set_state(GenStates.waiting_scene)
 
@@ -82,19 +122,19 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
 @router.message(Command("cancel"))
 async def cmd_cancel(message: Message, state: FSMContext) -> None:
     await state.clear()
-    await message.answer("Отменил текущий процесс. Команда /start чтобы начать заново.")
+    await message.answer("Отменил. Команда /start чтобы начать заново.")
 
 
 @router.message(Command("help"))
 async def cmd_help(message: Message) -> None:
     await message.answer(
-        "Я вписываю мебель из фото товара в фото твоей комнаты.\n\n"
-        "Шаги:\n"
+        "Я вписываю мебель в фото твоей комнаты. Шаги:\n\n"
         "1. Фото комнаты\n"
-        "2. Размеры комнаты в метрах (например 5x4) или 'не знаю'\n"
-        "3. Что заменить (sofa / armchair / bed / lamp / ...)\n"
-        "4. Фото товара (на белом фоне как в каталоге)\n"
-        "5. Размеры товара в см (например 220x90x85) или 'не знаю'\n\n"
+        "2. Описание комнаты и высота потолка (например «часть гостиной 18м², потолки 270см»)\n"
+        "3. Какой объект заменить (например «обеденный стол»)\n"
+        "4. Фото товара (как в каталоге — на белом фоне)\n"
+        "5. Размеры товара в см (например 140x90x76)\n\n"
+        "Дальше я прикину влезет ли товар и запущу подбор картинки.\n\n"
         "Команды: /start — начать, /cancel — отменить.",
     )
 
@@ -117,7 +157,6 @@ async def _download_photo(bot: Bot, message: Message) -> bytes:
 
 
 def _kb_qc_warn(prefix: str) -> InlineKeyboardBuilder:
-    """Клавиатура [Всё равно делать] / [Загрузить другое] для QC warn_user."""
     kb = InlineKeyboardBuilder()
     kb.button(text="✅ Всё равно делать", callback_data=f"qc:{prefix}:proceed")
     kb.button(text="🔄 Загрузить другое", callback_data=f"qc:{prefix}:retry")
@@ -145,7 +184,7 @@ async def receive_scene(message: Message, state: FSMContext, bot: Bot) -> None:
 
     if rec == "reject":
         await message.answer(f"❌ {user_msg or 'Это фото не подходит для интерьера.'}\n\nЗагрузи другое.")
-        return  # state остаётся waiting_scene
+        return
 
     if rec == "warn_user":
         kb = _kb_qc_warn("scene")
@@ -153,16 +192,16 @@ async def receive_scene(message: Message, state: FSMContext, bot: Bot) -> None:
             f"⚠️ {user_msg or 'Фото получилось не очень — качество результата может пострадать.'}\n\nЧто делаем?",
             reply_markup=kb.as_markup(),
         )
-        return  # переход внутри callback
+        return
 
-    await _ask_room_dims(message, state)
+    await _ask_room_info(message, state)
 
 
 @router.callback_query(F.data == "qc:scene:proceed")
 async def qc_scene_proceed(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
     if isinstance(callback.message, Message):
-        await _ask_room_dims(callback.message, state)
+        await _ask_room_info(callback.message, state)
 
 
 @router.callback_query(F.data == "qc:scene:retry")
@@ -172,32 +211,37 @@ async def qc_scene_retry(callback: CallbackQuery) -> None:
         await callback.message.answer("Жду новое фото комнаты.")
 
 
-# --- Размеры комнаты ---
+# --- Описание комнаты + потолок ---
 
 
-async def _ask_room_dims(message: Message, state: FSMContext) -> None:
+async def _ask_room_info(message: Message, state: FSMContext) -> None:
     await message.answer(
         "✓ Сцена принята.\n\n"
-        "📐 Размеры комнаты в метрах? Формат `длинаxширина`, например `5x4`.\n"
-        "Если не знаешь — напиши `не знаю`.",
-        parse_mode="Markdown",
+        "Опиши комнату и высоту потолка одним сообщением.\n\n"
+        "Примеры:\n"
+        "• «Часть гостиной около 18м², потолки 270см»\n"
+        "• «Спальня 12м², потолок 250см, фото половина комнаты»\n"
+        "• «Кухня-студия в новостройке, потолки 2.7 метра»\n\n"
+        "Высота потолка нужна обязательно — это масштаб для оценки размеров. "
+        "В обычных квартирах ~270см, в хрущёвках 250см, в сталинках 300-320см."
     )
-    await state.set_state(GenStates.waiting_room_dims)
+    await state.set_state(GenStates.waiting_room_info)
 
 
-@router.message(GenStates.waiting_room_dims, F.text)
-async def receive_room_dims(message: Message, state: FSMContext) -> None:
+@router.message(GenStates.waiting_room_info, F.text)
+async def receive_room_info(message: Message, state: FSMContext) -> None:
     if not message.text:
         return
     try:
-        room_dims = _parse_room_dims(message.text)
+        ceiling_cm, description = _parse_room_info(message.text)
     except ValueError:
         await message.answer(
-            "Не понял формат. Напиши как `5x4` (два числа через `x`) или `не знаю`.",
-            parse_mode="Markdown",
+            "Не нашёл высоту потолка в твоём сообщении. Напиши прямо число с единицей: «270см» или «2.7м».\n"
+            "Можно вместе с описанием, например: «Часть гостиной 18м², потолки 270см»."
         )
         return
-    await state.update_data(room_dims=room_dims)
+    await state.update_data(ceiling_cm=ceiling_cm, room_description=description)
+    await message.answer(f"✓ Понял: потолок {ceiling_cm}см.")
     await _ask_target_class(message, state)
 
 
@@ -205,10 +249,11 @@ async def receive_room_dims(message: Message, state: FSMContext) -> None:
 
 
 async def _ask_target_class(message: Message, state: FSMContext) -> None:
+    examples = ", ".join(known_examples(10))
     await message.answer(
-        "🛋 Что заменить в комнате?\n\n"
-        "Напиши на английском, например: `sofa`, `armchair`, `bed`, `lamp`, `coffee table`, `wardrobe`, `rug`.",
-        parse_mode="Markdown",
+        "Что заменить в комнате?\n\n"
+        f"Например: {examples}.\n\n"
+        "Пиши на русском, одной фразой."
     )
     await state.set_state(GenStates.waiting_target_class)
 
@@ -217,15 +262,20 @@ async def _ask_target_class(message: Message, state: FSMContext) -> None:
 async def receive_target_class(message: Message, state: FSMContext) -> None:
     if not message.text:
         return
-    target = message.text.strip().lower()
-    if not target or len(target) > 50:
-        await message.answer("Не понял. Напиши проще: `sofa`, `armchair`, `lamp`.", parse_mode="Markdown")
+    raw = message.text.strip()
+    if not raw or len(raw) > 60:
+        await message.answer("Не понял. Напиши проще, например «диван», «обеденный стол», «торшер».")
         return
-    await state.update_data(target_class=target)
+    target_en, target_ru, known = to_english(raw)
+    if not known:
+        await message.answer(
+            f"⚠️ «{raw}» — не нашёл в моём словаре, попробую угадать. "
+            "Если не получится — напиши проще, например «диван» или «стол»."
+        )
+    await state.update_data(target_en=target_en, target_ru=target_ru, target_known=known)
     await message.answer(
-        f"✓ Заменяем: **{target}**\n\n"
-        "📷 Загрузи **фото товара** (как в каталоге Hoff/WB/Ozon — на белом фоне, один предмет).",
-        parse_mode="Markdown",
+        f"✓ Заменяем: {target_ru}\n\n"
+        "Загрузи фото товара (как в каталоге — на белом фоне, один предмет)."
     )
     await state.set_state(GenStates.waiting_product_photo)
 
@@ -285,10 +335,11 @@ async def qc_product_retry(callback: CallbackQuery) -> None:
 
 async def _ask_product_dims(message: Message, state: FSMContext) -> None:
     await message.answer(
-        "✓ Товар принят.\n\n"
-        "📐 Размеры товара в сантиметрах? Формат `длинаxглубинаxвысота`, например `220x90x85`.\n"
-        "Если не знаешь — напиши `не знаю`.",
-        parse_mode="Markdown",
+        "Размеры товара в сантиметрах?\n\n"
+        "Формат: «длина x ширина x высота».\n"
+        "Например для дивана: 220x90x85.\n"
+        "Для обеденного стола: 140x90x76.\n\n"
+        "Если не знаешь — напиши «не знаю»."
     )
     await state.set_state(GenStates.waiting_product_dims)
 
@@ -301,18 +352,128 @@ async def receive_product_dims(message: Message, state: FSMContext) -> None:
         product_dims = _parse_product_dims(message.text)
     except ValueError:
         await message.answer(
-            "Не понял формат. Напиши как `220x90x85` (три числа через `x`) или `не знаю`.",
-            parse_mode="Markdown",
+            "Не понял формат. Напиши три числа через «x», например «220x90x85». Или «не знаю»."
         )
         return
     await state.update_data(product_dims=product_dims)
-    await _finish(message, state)
+
+    if product_dims is None:
+        # Размеры неизвестны — пропускаем pre-flight, идём сразу в финал (заглушка генерации)
+        await message.answer(
+            "✓ Размеры не указаны — пропускаю предварительную проверку.\n"
+            "Запускаю подбор..."
+        )
+        await _finish(message, state, slot=None, size_check=None)
+        return
+
+    await _run_pre_flight_check(message, state)
+
+
+async def _run_pre_flight_check(message: Message, state: FSMContext) -> None:
+    """Оценка слота через OpenAI vision + сравнение с размерами товара."""
+    data = await state.get_data()
+    scene_url = data.get("scene_url")
+    target_en = data.get("target_en") or "furniture"
+    target_ru = data.get("target_ru") or "мебель"
+    ceiling_cm = data.get("ceiling_cm") or 270
+    room_description = data.get("room_description") or ""
+    product_dims = data["product_dims"]
+
+    await message.answer("⏳ Проверяю влезет ли товар (5-10 секунд)...")
+
+    slot = await estimate_slot_dimensions(
+        scene_url=scene_url,
+        target_en=target_en,
+        target_ru=target_ru,
+        ceiling_cm=ceiling_cm,
+        room_description=room_description,
+    )
+
+    # Если ИИ говорит «этот объект вообще нетипичен для такой комнаты» — предупреждаем
+    if slot.get("is_target_appropriate_for_room") is False:
+        appropriate_msg = slot.get("appropriate_explanation") or ""
+        if appropriate_msg:
+            await message.answer(f"⚠️ {appropriate_msg}")
+
+    try:
+        size_check = compare_product_to_slot(product_dims, slot)
+    except ValueError:
+        logger.exception("Не удалось сравнить размеры")
+        await message.answer("❌ Не удалось оценить размеры. Запускаю как есть.")
+        await _finish(message, state, slot=slot, size_check=None)
+        return
+
+    await state.update_data(slot=slot, size_check=size_check)
+
+    verdict = size_check["verdict"]
+    if verdict == "fits_ok":
+        await message.answer("✅ По моей оценке всё должно поместиться. Запускаю подбор...")
+        await _finish(message, state, slot=slot, size_check=size_check)
+        return
+
+    # Marginal или doesnt_fit — кнопки
+    overrun = size_check["max_overrun_pct"]
+    slot_dims = size_check["slot_dims_cm"]
+    p_len, p_width, p_height = product_dims
+
+    if verdict == "marginal":
+        text = (
+            f"⚠️ По моей оценке твой {target_ru} `{int(p_len)}x{int(p_width)}x{int(p_height)}` "
+            f"примерно на {overrun:.0f}% больше места.\n\n"
+            f"В твоей комнате под {target_ru} обычно подходит ~"
+            f"{slot_dims['width']}x{slot_dims['depth']}x{slot_dims['height']} см.\n\n"
+            "Скорее всего будет тесновато. Что делаем?"
+        )
+    else:  # doesnt_fit
+        text = (
+            f"❌ По моей оценке твой {target_ru} `{int(p_len)}x{int(p_width)}x{int(p_height)}` "
+            f"на {overrun:.0f}% больше места.\n\n"
+            f"В твоей комнате под {target_ru} подойдёт максимум ~"
+            f"{slot_dims['width']}x{slot_dims['depth']}x{slot_dims['height']} см.\n\n"
+            "Возьми меньший размер или другой товар."
+        )
+
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✅ Всё равно попробовать", callback_data="size:proceed")
+    kb.button(text="🔄 Проверить размеры", callback_data="size:retry")
+    kb.adjust(2)
+
+    await message.answer(text, reply_markup=kb.as_markup())
+    await state.set_state(GenStates.confirming_size_mismatch)
+
+
+@router.callback_query(F.data == "size:proceed", GenStates.confirming_size_mismatch)
+async def size_proceed(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    data = await state.get_data()
+    if isinstance(callback.message, Message):
+        await callback.message.answer("Принял. Запускаю подбор...")
+        await _finish(
+            callback.message, state,
+            slot=data.get("slot"),
+            size_check=data.get("size_check"),
+        )
+
+
+@router.callback_query(F.data == "size:retry", GenStates.confirming_size_mismatch)
+async def size_retry(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    if isinstance(callback.message, Message):
+        await callback.message.answer(
+            "Хорошо. Перепроверь размеры товара на сайте магазина и пришли /start заново."
+        )
+    await state.clear()
 
 
 # --- Финал (заглушка генерации) ---
 
 
-async def _finish(message: Message, state: FSMContext) -> None:
+async def _finish(
+    message: Message,
+    state: FSMContext,
+    slot: dict | None,
+    size_check: dict | None,
+) -> None:
     data = await state.get_data()
     user_id = message.from_user.id if message.from_user else 0
 
@@ -320,20 +481,22 @@ async def _finish(message: Message, state: FSMContext) -> None:
         tg_user_id=user_id,
         scene_url=data.get("scene_url"),
         product_url=data.get("product_url"),
-        target_class=data.get("target_class"),
-        room_dims_m=data.get("room_dims"),
+        target_class=data.get("target_en"),
+        room_dims_m=None,
         product_dims_cm=data.get("product_dims"),
         scene_quality=data.get("scene_qc"),
         product_quality=data.get("product_qc"),
+        ceiling_height_cm=data.get("ceiling_cm"),
+        room_description=data.get("room_description"),
+        slot_estimation=slot,
+        size_check=size_check,
     )
 
     await message.answer(
-        "✨ Принял всё что нужно!\n\n"
-        f"📋 Сессия #{session_id} записана в базу.\n\n"
-        "🚧 **На этом этапе (Шаг 1+2) генерация картинки ещё не реализована** — это будет в Шагах 3-4.\n"
-        "Пока проверяем что весь диалог работает и фильтр плохих фото корректен.\n\n"
-        "Команда /start чтобы прогнать ещё один сценарий.",
-        parse_mode="Markdown",
+        f"✨ Принял всё что нужно! Сессия #{session_id} записана в базу.\n\n"
+        "🚧 На этом шаге генерация картинки ещё не реализована — это будет в Шагах 3-4.\n"
+        "Пока проверяем что весь диалог работает и предварительная оценка размеров корректна.\n\n"
+        "Команда /start чтобы прогнать ещё один сценарий."
     )
     await state.clear()
 
@@ -343,9 +506,9 @@ async def _finish(message: Message, state: FSMContext) -> None:
 
 @router.message(GenStates.waiting_scene)
 async def waiting_scene_other(message: Message) -> None:
-    await message.answer("Сейчас жду **фото** комнаты, а не текст. Загрузи фото.", parse_mode="Markdown")
+    await message.answer("Сейчас жду фото комнаты, а не текст. Загрузи фото.")
 
 
 @router.message(GenStates.waiting_product_photo)
 async def waiting_product_other(message: Message) -> None:
-    await message.answer("Сейчас жду **фото** товара. Загрузи фото.", parse_mode="Markdown")
+    await message.answer("Сейчас жду фото товара. Загрузи фото.")

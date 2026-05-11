@@ -6,16 +6,13 @@ States машина бота через `aiogram.fsm`. Хранилище — `M
 
 | State | Что ждём | На что переходит |
 |---|---|---|
-| `onboarding_step_1` | callback `onb:next:2` | `onboarding_step_2` |
-| `onboarding_step_2` | callback `onb:next:3` | `onboarding_step_3` |
-| `onboarding_step_3` | callback `onb:next:4` | `onboarding_step_4` |
-| `onboarding_step_4` | callback `onb:done` | `waiting_scene` |
-| `waiting_scene` | message с photo | quality_check → `waiting_room_dims` (или ждём другое фото) |
-| `waiting_room_dims` | text (например `5x4` или `не знаю`) | `waiting_target_class` |
-| `waiting_target_class` | text (`sofa`, `bed`, …) | `waiting_product_photo` |
+| `onboarding_step_1..4` | callback кнопок туториала | следующий шаг туториала / `waiting_scene` (Шаг 6) |
+| `waiting_scene` | message с photo | quality_check → `waiting_room_info` (или ждём другое фото) |
+| `waiting_room_info` | text «потолок 270см, часть гостиной 18м²» | парсинг → `waiting_target_class` |
+| `waiting_target_class` | text на русском («диван», «обеденный стол», …) | маппинг RU→EN → `waiting_product_photo` |
 | `waiting_product_photo` | message с photo | quality_check → `waiting_product_dims` |
-| `waiting_product_dims` | text (например `220x90x85` или `не знаю`) | запуск pipeline |
-| `confirming_warning` | callback `size_skip:yes/no` | запуск pipeline или отмена |
+| `waiting_product_dims` | text (например `220x90x85` или `не знаю`) | pre-flight check → `confirming_size_mismatch` (если на грани/не влезает) или сразу финал |
+| `confirming_size_mismatch` | callback `size:proceed` / `size:retry` | финал или сброс |
 
 ## Ключевые правила
 
@@ -37,9 +34,9 @@ States машина бота через `aiogram.fsm`. Хранилище — `M
 
 | Поле | Формат | Валидация |
 |---|---|---|
-| Room dims | `5x4`, `5х4`, `5×4`, или `не знаю/skip/нет` | 2 числа, оба в [1, 30] метров |
+| Room info | произвольный текст с фразой «N см / N м» где-то внутри | regex `\d+(\.\d+)?\s*(см|cm|мм|mm|м|m|метров|метра|метр)`, потолок 150-500 см после нормализации; иначе бот переспрашивает |
 | Product dims | `220x90x85`, или `не знаю` | 3 числа, все в [5, 1000] см |
-| Target class | свободный текст, длина ≤50 | непустое, lower'нутое |
+| Target class | свободный текст на русском, длина ≤60 | через `ai/object_mapping.to_english()`; если не нашли — предупреждаем, но идём дальше |
 
 Если формат не парсится — просим переписать, state НЕ меняем.
 
@@ -51,12 +48,16 @@ States машина бота через `aiogram.fsm`. Хранилище — `M
 {
     "scene_url": str,
     "scene_qc": dict,
-    "room_dims": tuple | None,
-    "target_class": str,
+    "ceiling_cm": int,            # высота потолка в см
+    "room_description": str,      # текстовое описание комнаты
+    "target_en": str,             # английское название для промптов/Replicate
+    "target_ru": str,             # каноническое русское для UI
+    "target_known": bool,         # нашли ли в словаре object_mapping
     "product_url": str,
     "product_qc": dict,
     "product_dims": tuple | None,
-    "session_id": int  # после log_session()
+    "slot": dict | None,          # результат estimate_slot_dimensions
+    "size_check": dict | None,    # результат compare_product_to_slot
 }
 ```
 

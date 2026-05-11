@@ -32,7 +32,11 @@ def _connect() -> sqlite3.Connection:
 
 
 def init_db() -> None:
-    """Создаёт таблицы если их ещё нет. Идемпотентно."""
+    """Создаёт таблицы если их ещё нет. Идемпотентно.
+
+    Также добавляет недостающие колонки в существующие таблицы (для апгрейда
+    старых БД без удаления данных). См. _ensure_columns ниже.
+    """
     with _connect() as conn:
         conn.executescript("""
             CREATE TABLE IF NOT EXISTS users (
@@ -52,9 +56,13 @@ def init_db() -> None:
                 target_class TEXT,
                 room_dims_m TEXT,
                 product_dims_cm TEXT,
+                ceiling_height_cm INTEGER,
+                room_description TEXT,
                 scene_quality_json TEXT,
                 product_quality_json TEXT,
                 scene_analysis_json TEXT,
+                slot_estimation_json TEXT,
+                size_check_json TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
 
@@ -81,7 +89,27 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_generations_session
                 ON generations(session_id, created_at);
         """)
+        _ensure_columns(conn)
     logger.info("БД инициализирована: %s", _db_path())
+
+
+def _ensure_columns(conn: sqlite3.Connection) -> None:
+    """Добавить недостающие колонки в существующую БД (для апгрейда).
+
+    SQLite не поддерживает IF NOT EXISTS у ALTER TABLE, поэтому идём через
+    PRAGMA table_info и добавляем то чего нет.
+    """
+    needed_in_sessions = {
+        "ceiling_height_cm": "INTEGER",
+        "room_description": "TEXT",
+        "slot_estimation_json": "TEXT",
+        "size_check_json": "TEXT",
+    }
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(sessions)")}
+    for col, col_type in needed_in_sessions.items():
+        if col not in existing:
+            conn.execute(f"ALTER TABLE sessions ADD COLUMN {col} {col_type}")
+            logger.info("Добавлена колонка sessions.%s", col)
 
 
 def touch_user(tg_user_id: int, username: str | None) -> None:
@@ -132,6 +160,10 @@ def log_session(
     scene_quality: dict | None = None,
     product_quality: dict | None = None,
     scene_analysis: dict | None = None,
+    ceiling_height_cm: int | None = None,
+    room_description: str | None = None,
+    slot_estimation: dict | None = None,
+    size_check: dict | None = None,
 ) -> int:
     """Сохранить сессию пользователя. Возвращает id новой записи."""
     with _connect() as conn:
@@ -140,8 +172,10 @@ def log_session(
             INSERT INTO sessions
                 (tg_user_id, scene_url, product_url, target_class,
                  room_dims_m, product_dims_cm,
-                 scene_quality_json, product_quality_json, scene_analysis_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 ceiling_height_cm, room_description,
+                 scene_quality_json, product_quality_json, scene_analysis_json,
+                 slot_estimation_json, size_check_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 tg_user_id,
@@ -150,9 +184,13 @@ def log_session(
                 target_class,
                 json.dumps(list(room_dims_m)) if room_dims_m else None,
                 json.dumps(list(product_dims_cm)) if product_dims_cm else None,
+                ceiling_height_cm,
+                room_description,
                 json.dumps(scene_quality) if scene_quality else None,
                 json.dumps(product_quality) if product_quality else None,
                 json.dumps(scene_analysis) if scene_analysis else None,
+                json.dumps(slot_estimation) if slot_estimation else None,
+                json.dumps(size_check) if size_check else None,
             ),
         )
         return int(cur.lastrowid or 0)

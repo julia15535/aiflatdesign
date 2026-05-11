@@ -1,6 +1,55 @@
 # Stage 1: Scene Analysis + Slot Detection
 
-Параллельно: (1) Vision-анализ сцены через GPT-5.4 Mini high-detail, (2) Поиск слота под target_class через GroundedSAM.
+В **Шаге 2.5** (pre-flight check) реализована **упрощённая** версия — только оценка размеров слота через OpenAI vision **без** GroundedSAM. Точная маска через GroundedSAM добавится в Шаге 3.
+
+## Шаг 2.5: estimate_slot_dimensions (упрощённая версия)
+
+Файл: `ai/scene_analysis.py`
+
+```python
+async def estimate_slot_dimensions(
+    scene_url: str,
+    target_en: str,        # "dining table"
+    target_ru: str,        # "обеденный стол"
+    ceiling_cm: int,       # 270
+    room_description: str, # "Часть гостиной 18м²"
+) -> dict
+```
+
+Возвращает:
+```json
+{
+  "scale_references": ["window ~150cm высота", "radiator ~60cm", ...],
+  "estimated_slot": {"width_cm": 140, "depth_cm": 90, "height_cm": 76},
+  "confidence": "low | medium | high",
+  "reasoning": "у эркера обычно ставят обеденный стол 120-140см...",
+  "warnings": ["комната видна только частично"],
+  "is_target_appropriate_for_room": true,
+  "appropriate_explanation": ""
+}
+```
+
+**Промпт**: `SLOT_ESTIMATION` в `ai/prompts.py`. Использует:
+- Высоту потолка как масштабную линейку
+- Описание комнаты как контекст
+- Английское название объекта для понимания типичных размеров
+
+**Detail**: `high` — критично видеть мелкие референсы (плинтус, розетки, сиденья стульев).
+
+**Fallback**: при ошибке API / неверном JSON / некорректных размерах — возвращаем дефолтные размеры для типа объекта (см. `_DEFAULT_SLOTS`) + `confidence=low` + `_fallback=true`.
+
+## Полная версия (Шаг 3)
+
+В Шаге 3 параллельно к `estimate_slot_dimensions` будет работать GroundedSAM:
+
+```python
+async def detect_target_slot(image_url: str, target_class: str) -> dict:
+    # → {mask_url, bbox, found}
+```
+
+И `analyze_scene(image_url)` через OpenAI — для определения стиля/освещения/сцены (понадобится для генерационного промпта FLUX).
+
+
 
 ## Vision-анализ сцены
 
